@@ -2811,6 +2811,11 @@ defmodule DurableServer.Supervisor do
     :"#{supervisor}_task_sup"
   end
 
+  @doc false
+  def heartbeat_watchdog_name(supervisor) when is_atom(supervisor) do
+    :"#{supervisor}_heartbeat_watchdog"
+  end
+
   @impl Supervisor
   def init(opts) do
     opts =
@@ -3109,6 +3114,7 @@ defmodule DurableServer.Supervisor do
 
     dynamic_sup_name = get_dynamic_supervisor(name)
     task_sup_name = get_task_supervisor(name)
+    heartbeat_watchdog_name = heartbeat_watchdog_name(name)
 
     shutdown_timeout = config.supervisor_shutdown_timeout_ms
     presence_scope = presence_pg_scope(name)
@@ -3139,10 +3145,12 @@ defmodule DurableServer.Supervisor do
            max_children: max_children,
            max_restarts: 1000,
            max_seconds: 5},
+          {DurableServer.HeartbeatWatchdog, name: heartbeat_watchdog_name, supervisor_name: name},
           Supervisor.child_spec(
             {LifecycleManager,
              supervisor_name: name,
              task_supervisor: task_sup_name,
+             heartbeat_watchdog: heartbeat_watchdog_name,
              object_store: object_store,
              storage_backend: storage_backend,
              heartbeat_backend: heartbeat_backend,

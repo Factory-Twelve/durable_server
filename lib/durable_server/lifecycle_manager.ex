@@ -101,7 +101,7 @@ defmodule DurableServer.LifecycleManager do
 
   alias DurableServer.LifecycleManager
   alias DurableServer
-  alias DurableServer.{StoredState, Meta, CircuitBreaker}
+  alias DurableServer.{StoredState, Meta, CircuitBreaker, HeartbeatWatchdog}
   alias DurableServer.ObjectStore
   alias DurableServer.StorageBackend
 
@@ -125,7 +125,7 @@ defmodule DurableServer.LifecycleManager do
             capacity_limits: %{},
             heartbeat_meta: nil,
             last_successful_heartbeat_at: nil,
-            heartbeat_deadline_timer: nil,
+            heartbeat_watchdog: nil,
             # Last successful heartbeat timing for diagnostics
             last_heartbeat_timing: nil,
             discovery_diag_table: nil,
@@ -326,6 +326,13 @@ defmodule DurableServer.LifecycleManager do
     capacity_limits = Keyword.get(opts, :capacity_limits, %{})
     heartbeat_meta = Keyword.get(opts, :heartbeat_meta)
 
+    heartbeat_watchdog =
+      Keyword.get(
+        opts,
+        :heartbeat_watchdog,
+        DurableServer.Supervisor.heartbeat_watchdog_name(supervisor_name)
+      )
+
     config =
       opts
       |> Keyword.get(:config, %{
@@ -403,6 +410,7 @@ defmodule DurableServer.LifecycleManager do
       heartbeat_reconcile_interval_ms: config.heartbeat_reconcile_interval_ms,
       capacity_limits: capacity_limits,
       heartbeat_meta: heartbeat_meta,
+      heartbeat_watchdog: heartbeat_watchdog,
       discovery_diag_table: diagnostics_tab,
       discovery_skip_table: skip_tab,
       restart_gate_table: restart_gate_tab,
@@ -454,6 +462,14 @@ defmodule DurableServer.LifecycleManager do
     # S3 is the source of truth for liveness; Group is the fast path for discovery.
     join_group_heartbeat(state, heartbeat_entry)
 
+    :ok =
+      HeartbeatWatchdog.arm(
+        state.heartbeat_watchdog,
+        self(),
+        heartbeat_entry_timestamp(heartbeat_entry),
+        heartbeat_hard_deadline_ms(state)
+      )
+
     {:ok,
      %{
        state
@@ -476,74 +492,24 @@ defmodule DurableServer.LifecycleManager do
 
       {:stop, {:heartbeat_deadline_exceeded, state.last_successful_heartbeat_at}, state}
     else
-      # Cancel any existing deadline timer
-      if state.heartbeat_deadline_timer do
-        Process.cancel_timer(state.heartbeat_deadline_timer)
-      end
-
-      # Set watchdog timer to fire at deadline
-      timer_delay = deadline_at - now
-      deadline_timer = Process.send_after(self(), :heartbeat_deadline_exceeded, timer_delay)
+      owner = self()
+      heartbeat_watchdog = state.heartbeat_watchdog
 
       task =
         Task.Supervisor.async(state.task_sup, fn ->
-          {:heartbeat, perform_heartbeat(state)}
+          :ok = HeartbeatWatchdog.track_heartbeat_task(heartbeat_watchdog, owner, self())
+          {timing, heartbeat_entry} = perform_heartbeat(state)
+
+          HeartbeatWatchdog.renew(
+            heartbeat_watchdog,
+            owner,
+            heartbeat_entry_timestamp(heartbeat_entry)
+          )
+
+          {:heartbeat, {timing, heartbeat_entry}}
         end)
 
-      {:noreply,
-       %{state | current_heartbeat_task: task, heartbeat_deadline_timer: deadline_timer}}
-    end
-  end
-
-  def handle_info(:heartbeat_deadline_exceeded, %LifecycleManager{} = state) do
-    deadline_ms = heartbeat_hard_deadline_ms(state)
-    elapsed_since_last = System.system_time(:millisecond) - state.last_successful_heartbeat_at
-
-    # Check if heartbeat success message arrived (race window)
-    case state.current_heartbeat_task do
-      %Task{ref: ref} ->
-        receive do
-          {^ref, {:heartbeat, {timing, heartbeat_entry}}} ->
-            # Heartbeat actually succeeded! Don't crash, but log the close call.
-            Process.demonitor(ref, [:flush])
-            Process.send_after(self(), :heartbeat, state.heartbeat_interval_ms)
-            join_group_heartbeat(state, heartbeat_entry)
-
-            log(state, :warning, fn ->
-              "heartbeat narrowly beat deadline: #{timing.total_ms}ms (put: #{timing.put_ms}ms, cache: #{timing.cache_ms}ms), deadline was #{deadline_ms}ms"
-            end)
-
-            {:noreply,
-             %{
-               state
-               | current_heartbeat_task: nil,
-                 heartbeat_deadline_timer: nil,
-                 last_successful_heartbeat_at: heartbeat_entry_timestamp(heartbeat_entry),
-                 last_heartbeat_timing: timing
-             }}
-        after
-          0 ->
-            # No success in mailbox - truly failed, crash
-            prev_timing_info =
-              case state.last_heartbeat_timing do
-                %{put_ms: put_ms, cache_ms: cache_ms, total_ms: total_ms} ->
-                  ", previous heartbeat timing: #{total_ms}ms (put: #{put_ms}ms, cache: #{cache_ms}ms)"
-
-                nil ->
-                  ""
-              end
-
-            log(state, :error, fn ->
-              "heartbeat deadline exceeded (#{elapsed_since_last}ms since last success, deadline #{deadline_ms}ms#{prev_timing_info}), stopping supervisor tree to prevent orphan conflicts"
-            end)
-
-            Task.shutdown(state.current_heartbeat_task, :brutal_kill)
-            {:stop, {:heartbeat_deadline_exceeded, state.last_successful_heartbeat_at}, state}
-        end
-
-      nil ->
-        # No task running, this is a stale timer - ignore
-        {:noreply, %{state | heartbeat_deadline_timer: nil}}
+      {:noreply, %{state | current_heartbeat_task: task}}
     end
   end
 
@@ -660,11 +626,7 @@ defmodule DurableServer.LifecycleManager do
         {ref, {:heartbeat, {timing, heartbeat_entry}}},
         %LifecycleManager{current_heartbeat_task: %Task{ref: ref}} = state
       ) do
-    # heartbeat task completed successfully, cancel deadline timer and schedule next run
-    if state.heartbeat_deadline_timer do
-      Process.cancel_timer(state.heartbeat_deadline_timer)
-    end
-
+    # heartbeat task completed successfully and already renewed the watchdog directly.
     Process.demonitor(ref, [:flush])
     Process.send_after(self(), :heartbeat, state.heartbeat_interval_ms)
 
@@ -683,7 +645,6 @@ defmodule DurableServer.LifecycleManager do
      %{
        state
        | current_heartbeat_task: nil,
-         heartbeat_deadline_timer: nil,
          last_successful_heartbeat_at: heartbeat_entry_timestamp(heartbeat_entry),
          last_heartbeat_timing: timing
      }}
@@ -743,6 +704,12 @@ defmodule DurableServer.LifecycleManager do
     state =
       case write_node_heartbeat(state) do
         {:ok, heartbeat_entry} ->
+          HeartbeatWatchdog.renew(
+            state.heartbeat_watchdog,
+            self(),
+            heartbeat_entry_timestamp(heartbeat_entry)
+          )
+
           join_group_heartbeat(state, heartbeat_entry)
           %{state | last_successful_heartbeat_at: heartbeat_entry_timestamp(heartbeat_entry)}
 
@@ -779,6 +746,7 @@ defmodule DurableServer.LifecycleManager do
 
   @impl true
   def terminate(_reason, %LifecycleManager{} = state) do
+    HeartbeatWatchdog.disarm(state.heartbeat_watchdog, self())
     _ = maybe_delete_own_heartbeat(state)
     _ = maybe_stop_heartbeat_subscription(state)
     :ok

@@ -216,6 +216,92 @@ defmodule DurableServer.LifecycleTest do
       do: StorageBackend.unsubscribe(delegate, subscription_ref)
   end
 
+  defmodule HeartbeatHangAfterFirstBackend do
+    @behaviour DurableServer.StorageBackend
+
+    alias DurableServer.StorageBackend
+
+    @impl true
+    def init_backend(opts) do
+      delegate =
+        case Keyword.fetch!(opts, :delegate) do
+          %StorageBackend{} = backend ->
+            backend
+
+          {adapter, raw_opts} ->
+            {:ok, backend} = StorageBackend.init_backend(adapter, raw_opts)
+            backend
+        end
+
+      {:ok,
+       %{
+         state: %{
+           delegate: delegate,
+           table: Keyword.fetch!(opts, :table),
+           hang_after: Keyword.fetch!(opts, :hang_after),
+           notify_pid: Keyword.fetch!(opts, :notify_pid)
+         },
+         defaults: StorageBackend.defaults(delegate),
+         features: StorageBackend.features(delegate)
+       }}
+    end
+
+    @impl true
+    def ensure_ready(%{delegate: delegate}), do: StorageBackend.ensure_ready(delegate)
+
+    @impl true
+    def get_object(%{delegate: delegate}, key, opts),
+      do: StorageBackend.get_object(delegate, key, opts)
+
+    @impl true
+    def list_all_objects_stream(%{delegate: delegate}, prefix, opts),
+      do: StorageBackend.list_all_objects_stream(delegate, prefix, opts)
+
+    @impl true
+    def put_object(
+          %{delegate: delegate, table: table, hang_after: hang_after, notify_pid: notify_pid},
+          key,
+          data,
+          opts
+        ) do
+      if String.contains?(key, "__nodes/") do
+        attempt = :ets.update_counter(table, :heartbeat_puts, {2, 1}, {:heartbeat_puts, 0})
+
+        if attempt >= hang_after do
+          send(notify_pid, {:hanging_heartbeat_task, self()})
+          Process.sleep(:infinity)
+        end
+      end
+
+      StorageBackend.put_object(delegate, key, data, opts)
+    end
+
+    @impl true
+    def delete_object(%{delegate: delegate}, key), do: StorageBackend.delete_object(delegate, key)
+
+    @impl true
+    def try_claim(%{delegate: delegate}, key, body),
+      do: StorageBackend.try_claim(delegate, key, body)
+
+    @impl true
+    def update_object(%{delegate: delegate}, key, update_fn, opts),
+      do: StorageBackend.update_object(delegate, key, update_fn, opts)
+
+    @impl true
+    def encode(%{delegate: delegate}, data), do: StorageBackend.encode(delegate, data)
+
+    @impl true
+    def decode(%{delegate: delegate}, data), do: StorageBackend.decode(delegate, data)
+
+    @impl true
+    def subscribe(%{delegate: delegate}, subscriber, prefix, opts),
+      do: StorageBackend.subscribe(delegate, subscriber, prefix, opts)
+
+    @impl true
+    def unsubscribe(%{delegate: delegate}, subscription_ref),
+      do: StorageBackend.unsubscribe(delegate, subscription_ref)
+  end
+
   defmodule HeartbeatConflictBackend do
     @behaviour DurableServer.StorageBackend
 
@@ -1643,6 +1729,19 @@ defmodule DurableServer.LifecycleTest do
     # Create TaskSupervisor for standalone testing
     task_sup_name = :"#{standalone_supervisor_name}_task_sup"
     _ = start_supervised!({Task.Supervisor, name: task_sup_name})
+
+    heartbeat_watchdog_name =
+      DurableServer.Supervisor.heartbeat_watchdog_name(standalone_supervisor_name)
+
+    _ =
+      start_supervised!(
+        Supervisor.child_spec(
+          {DurableServer.HeartbeatWatchdog,
+           name: heartbeat_watchdog_name, supervisor_name: standalone_supervisor_name},
+          id: heartbeat_watchdog_name
+        )
+      )
+
     presence_scope = DurableServer.Supervisor.presence_pg_scope(standalone_supervisor_name)
     _ = start_supervised!(%{id: presence_scope, start: {:pg, :start_link, [presence_scope]}})
 
@@ -1651,12 +1750,18 @@ defmodule DurableServer.LifecycleTest do
       [
         supervisor_name: standalone_supervisor_name,
         task_supervisor: task_sup_name,
+        heartbeat_watchdog: heartbeat_watchdog_name,
         object_store: config.object_store,
         config: config,
         circuit_breaker: circuit_breaker
       ] ++ opts
 
-    start_supervised({LifecycleManager, manager_opts}, id: standalone_supervisor_name)
+    start_supervised(
+      Supervisor.child_spec({LifecycleManager, manager_opts},
+        id: standalone_supervisor_name,
+        restart: :temporary
+      )
+    )
   end
 
   # Helper function to wait for discovery task completion or manager crash
@@ -2524,6 +2629,58 @@ defmodule DurableServer.LifecycleTest do
       assert [{:last_write, heartbeat_data}] = :ets.lookup(table, :last_write)
       assert is_map(heartbeat_data)
       assert Map.has_key?(heartbeat_data, "last_heartbeat_at")
+    end
+
+    test "heartbeat watchdog terminates lifecycle manager even when message handling is suspended",
+         %{
+           supervisor_name: supervisor_name,
+           config: config
+         } do
+      test_config =
+        config
+        |> Map.put(:heartbeat_staleness_threshold_ms, 2_200)
+        |> Map.put(:heartbeat_interval_ms, 100)
+
+      {:ok, manager_pid} = start_standalone_lifecycle_manager(supervisor_name, test_config)
+
+      ref = Process.monitor(manager_pid)
+      :ok = :sys.suspend(manager_pid)
+
+      assert_receive {:DOWN, ^ref, :process, ^manager_pid, :killed}, 1_500
+    end
+
+    test "heartbeat watchdog kills an in-flight heartbeat task before terminating lifecycle manager",
+         %{
+           supervisor_name: supervisor_name,
+           config: config
+         } do
+      table = :ets.new(__MODULE__.HeartbeatHangAfterFirstBackend, [:set, :public])
+
+      {:ok, storage_backend} =
+        DurableServer.StorageBackend.init_backend(HeartbeatHangAfterFirstBackend,
+          delegate: {DurableServer.Backends.ObjectStore, test_object_store_opts()},
+          table: table,
+          hang_after: 2,
+          notify_pid: self()
+        )
+
+      test_config =
+        config
+        |> Map.put(:object_store, storage_backend)
+        |> Map.put(:storage_backend, storage_backend)
+        |> Map.put(:heartbeat_staleness_threshold_ms, 2_200)
+        |> Map.put(:heartbeat_interval_ms, 100)
+
+      {:ok, manager_pid} = start_standalone_lifecycle_manager(supervisor_name, test_config)
+      manager_ref = Process.monitor(manager_pid)
+
+      assert_receive {:hanging_heartbeat_task, heartbeat_task_pid}, 1_000
+      heartbeat_task_ref = Process.monitor(heartbeat_task_pid)
+
+      assert_receive {:DOWN, ^heartbeat_task_ref, :process, ^heartbeat_task_pid, :killed}, 1_500
+
+      assert_receive {:DOWN, ^manager_ref, :process, ^manager_pid, manager_reason}, 1_500
+      assert manager_reason in [:killed, {:heartbeat_failed, :killed}]
     end
 
     test "group heartbeat join timeout does not crash the lifecycle manager handler", %{
