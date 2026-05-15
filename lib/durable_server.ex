@@ -1443,21 +1443,45 @@ defmodule DurableServer do
     end
   end
 
-  @doc """
-  Attempt to atomically claim a restart attempt for a server.
-
-  Returns `:ok` if the claim succeeds, or `{:error, reason}` if it fails.
-  """
+  @doc false
   def claim_restart_attempt(%ObjectStore{} = store, %StoredState{} = stored_state, opts) do
     backend = StorageBackend.new(DurableServer.Backends.ObjectStore, store)
     claim_restart_attempt(backend, stored_state, opts)
   end
 
   def claim_restart_attempt(%StorageBackend{} = store, %StoredState{} = stored_state, opts) do
-    opts = Keyword.validate!(opts, [:ttl, :skip_lock_check])
+    do_claim_restart_attempt(store, stored_state, opts, :check_lock)
+  end
+
+  @doc false
+  def claim_restart_attempt_with_verified_expired_lock(
+        %ObjectStore{} = store,
+        %StoredState{} = stored_state,
+        opts
+      ) do
+    backend = StorageBackend.new(DurableServer.Backends.ObjectStore, store)
+    claim_restart_attempt_with_verified_expired_lock(backend, stored_state, opts)
+  end
+
+  def claim_restart_attempt_with_verified_expired_lock(
+        %StorageBackend{} = store,
+        %StoredState{} = stored_state,
+        opts
+      ) do
+    do_claim_restart_attempt(store, stored_state, opts, :verified_expired_lock)
+  end
+
+  defp do_claim_restart_attempt(
+         %StorageBackend{} = store,
+         %StoredState{} = stored_state,
+         opts,
+         lock_check
+       )
+       when lock_check in [:check_lock, :verified_expired_lock] do
+    opts = Keyword.validate!(opts, [:ttl])
     ttl_ms = Keyword.fetch!(opts, :ttl)
-    skip_lock_check? = Keyword.get(opts, :skip_lock_check, false)
     %{meta: meta} = stored_state
+
     storage_key = stored_state.prefix <> stored_state.key
 
     cond do
@@ -1467,7 +1491,7 @@ defmodule DurableServer do
       Meta.stopped_permanently?(meta) ->
         {:error, :not_eligible}
 
-      not skip_lock_check? and match?({:locked, _}, check_lock(meta)) ->
+      not restart_claim_lock_available?(meta, lock_check) ->
         {:error, :not_eligible}
 
       true ->
@@ -1488,6 +1512,12 @@ defmodule DurableServer do
           {:error, reason} -> {:error, reason}
         end
     end
+  end
+
+  defp restart_claim_lock_available?(%Meta{}, :verified_expired_lock), do: true
+
+  defp restart_claim_lock_available?(%Meta{} = meta, :check_lock) do
+    not match?({:locked, _}, check_lock(meta))
   end
 
   @doc """

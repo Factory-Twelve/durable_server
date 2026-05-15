@@ -139,6 +139,83 @@ defmodule DurableServer.LifecycleTest do
     def decode(_state, data), do: {:ok, data}
   end
 
+  defmodule HeartbeatDelayBackend do
+    @behaviour DurableServer.StorageBackend
+
+    alias DurableServer.StorageBackend
+
+    @impl true
+    def init_backend(opts) do
+      delegate =
+        case Keyword.fetch!(opts, :delegate) do
+          %StorageBackend{} = backend ->
+            backend
+
+          {adapter, raw_opts} ->
+            {:ok, backend} = StorageBackend.init_backend(adapter, raw_opts)
+            backend
+        end
+
+      {:ok,
+       %{
+         state: %{
+           delegate: delegate,
+           table: Keyword.fetch!(opts, :table),
+           delay_ms: Keyword.fetch!(opts, :delay_ms)
+         },
+         defaults: StorageBackend.defaults(delegate),
+         features: StorageBackend.features(delegate)
+       }}
+    end
+
+    @impl true
+    def ensure_ready(%{delegate: delegate}), do: StorageBackend.ensure_ready(delegate)
+
+    @impl true
+    def get_object(%{delegate: delegate}, key, opts),
+      do: StorageBackend.get_object(delegate, key, opts)
+
+    @impl true
+    def list_all_objects_stream(%{delegate: delegate}, prefix, opts),
+      do: StorageBackend.list_all_objects_stream(delegate, prefix, opts)
+
+    @impl true
+    def put_object(%{delegate: delegate, table: table, delay_ms: delay_ms}, key, data, opts) do
+      if String.contains?(key, "__nodes/") do
+        :ets.insert(table, {:heartbeat_write_started_at, System.system_time(:millisecond)})
+        :ets.insert(table, {:heartbeat_write, data})
+        Process.sleep(delay_ms)
+      end
+
+      StorageBackend.put_object(delegate, key, data, opts)
+    end
+
+    @impl true
+    def delete_object(%{delegate: delegate}, key), do: StorageBackend.delete_object(delegate, key)
+
+    @impl true
+    def try_claim(%{delegate: delegate}, key, body),
+      do: StorageBackend.try_claim(delegate, key, body)
+
+    @impl true
+    def update_object(%{delegate: delegate}, key, update_fn, opts),
+      do: StorageBackend.update_object(delegate, key, update_fn, opts)
+
+    @impl true
+    def encode(%{delegate: delegate}, data), do: StorageBackend.encode(delegate, data)
+
+    @impl true
+    def decode(%{delegate: delegate}, data), do: StorageBackend.decode(delegate, data)
+
+    @impl true
+    def subscribe(%{delegate: delegate}, subscriber, prefix, opts),
+      do: StorageBackend.subscribe(delegate, subscriber, prefix, opts)
+
+    @impl true
+    def unsubscribe(%{delegate: delegate}, subscription_ref),
+      do: StorageBackend.unsubscribe(delegate, subscription_ref)
+  end
+
   defmodule HeartbeatConflictBackend do
     @behaviour DurableServer.StorageBackend
 
@@ -777,6 +854,67 @@ defmodule DurableServer.LifecycleTest do
       heartbeat_table = :"durable_server_heartbeats_#{supervisor_name}"
       stale_timestamp = now - 60_000
       :ets.insert(heartbeat_table, {node_str, node_ref, stale_timestamp, %{}, %{}, %{}, nil})
+
+      assert {:locked, ^pid} = DurableServer.check_lock(stored_state.meta)
+
+      assert {:error, :not_eligible} =
+               DurableServer.claim_restart_attempt(backend, stored_state, ttl: 10_000)
+    end
+
+    test "running restart claims revalidate heartbeat before claiming stale running meta", %{
+      supervisor_name: supervisor_name,
+      prefix: prefix
+    } do
+      %{storage_backend: backend} = DurableServer.Supervisor.__get_config__(supervisor_name)
+
+      key = "running-claim-revalidate-#{DurableServer.UUID.uuid4()}"
+      node_str = "remote-revalidated@test"
+      node_ref = System.unique_integer([:positive])
+      pid = self()
+      now = System.system_time(:millisecond)
+
+      stored_state = %DurableServer.StoredState{
+        vsn: 1,
+        state: %{"count" => 1},
+        meta: %Meta{
+          key: key,
+          prefix: prefix,
+          supervisor: supervisor_name,
+          module: TestServer,
+          permanent: true,
+          status: :running,
+          node_str: node_str,
+          node_ref: node_ref,
+          pid: pid,
+          last_heartbeat_at: now - 60_000
+        }
+      }
+
+      assert {:ok, _} =
+               DurableServer.StorageBackend.put_object(
+                 backend,
+                 "#{prefix}#{key}",
+                 stored_state
+               )
+
+      assert {:ok, %DurableServer.StoredState{} = stored_state} =
+               DurableServer.fetch_stored_state(
+                 backend,
+                 %{key: key, prefix: prefix}
+               )
+
+      heartbeat_data = %{
+        "node" => node_str,
+        "node_ref" => node_ref,
+        "last_heartbeat_at" => System.system_time(:millisecond)
+      }
+
+      assert {:ok, _} =
+               DurableServer.StorageBackend.put_object(
+                 backend,
+                 "#{prefix}__nodes/#{node_str}",
+                 heartbeat_data
+               )
 
       assert {:locked, ^pid} = DurableServer.check_lock(stored_state.meta)
 
@@ -2327,6 +2465,36 @@ defmodule DurableServer.LifecycleTest do
 
       # Manager should still be alive and ready for next cycle
       assert_process_alive(manager_pid)
+      GenServer.stop(manager_pid)
+    end
+
+    test "heartbeat owner deadline is based on the timestamp written to storage", %{
+      supervisor_name: supervisor_name,
+      config: config
+    } do
+      table = :ets.new(__MODULE__.HeartbeatDelayBackend, [:set, :public])
+
+      {:ok, storage_backend} =
+        DurableServer.StorageBackend.init_backend(HeartbeatDelayBackend,
+          delegate: {DurableServer.Backends.ObjectStore, test_object_store_opts()},
+          table: table,
+          delay_ms: 2_200
+        )
+
+      test_config =
+        config
+        |> Map.put(:object_store, storage_backend)
+        |> Map.put(:storage_backend, storage_backend)
+
+      {:ok, manager_pid} = start_standalone_lifecycle_manager(supervisor_name, test_config)
+      manager_state = :sys.get_state(manager_pid)
+
+      assert [{:heartbeat_write, %{"last_heartbeat_at" => stored_heartbeat_at}}] =
+               :ets.lookup(table, :heartbeat_write)
+
+      # Remote stale checks use this stored timestamp, so local self-kill math must too.
+      assert abs(manager_state.last_successful_heartbeat_at - stored_heartbeat_at) < 500
+
       GenServer.stop(manager_pid)
     end
 

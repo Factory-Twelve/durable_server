@@ -457,7 +457,7 @@ defmodule DurableServer.LifecycleManager do
     {:ok,
      %{
        state
-       | last_successful_heartbeat_at: System.system_time(:millisecond),
+       | last_successful_heartbeat_at: heartbeat_entry_timestamp(heartbeat_entry),
          last_heartbeat_timing: timing
      }}
   end
@@ -506,7 +506,6 @@ defmodule DurableServer.LifecycleManager do
           {^ref, {:heartbeat, {timing, heartbeat_entry}}} ->
             # Heartbeat actually succeeded! Don't crash, but log the close call.
             Process.demonitor(ref, [:flush])
-            now = System.system_time(:millisecond)
             Process.send_after(self(), :heartbeat, state.heartbeat_interval_ms)
             join_group_heartbeat(state, heartbeat_entry)
 
@@ -519,7 +518,7 @@ defmodule DurableServer.LifecycleManager do
                state
                | current_heartbeat_task: nil,
                  heartbeat_deadline_timer: nil,
-                 last_successful_heartbeat_at: now,
+                 last_successful_heartbeat_at: heartbeat_entry_timestamp(heartbeat_entry),
                  last_heartbeat_timing: timing
              }}
         after
@@ -685,7 +684,7 @@ defmodule DurableServer.LifecycleManager do
        state
        | current_heartbeat_task: nil,
          heartbeat_deadline_timer: nil,
-         last_successful_heartbeat_at: System.system_time(:millisecond),
+         last_successful_heartbeat_at: heartbeat_entry_timestamp(heartbeat_entry),
          last_heartbeat_timing: timing
      }}
   end
@@ -745,7 +744,7 @@ defmodule DurableServer.LifecycleManager do
       case write_node_heartbeat(state) do
         {:ok, heartbeat_entry} ->
           join_group_heartbeat(state, heartbeat_entry)
-          %{state | last_successful_heartbeat_at: System.system_time(:millisecond)}
+          %{state | last_successful_heartbeat_at: heartbeat_entry_timestamp(heartbeat_entry)}
 
         {:error, reason} ->
           log(state, :warning, fn ->
@@ -1077,6 +1076,13 @@ defmodule DurableServer.LifecycleManager do
   defp heartbeat_deadline_at(%LifecycleManager{} = state, last_successful_heartbeat_at)
        when is_integer(last_successful_heartbeat_at) do
     last_successful_heartbeat_at + heartbeat_hard_deadline_ms(state)
+  end
+
+  defp heartbeat_entry_timestamp(
+         {_node_str, _node_ref, timestamp, _capacity, _resources, _env_vars, _heartbeat_meta}
+       )
+       when is_integer(timestamp) do
+    timestamp
   end
 
   defp heartbeat_write_retryable?({:mirror_failed, reason}),
@@ -1979,7 +1985,7 @@ defmodule DurableServer.LifecycleManager do
     |> Task.async_stream(
       fn {%{key: key, etag: etag} = entry, local_candidate_batch_size} ->
         case get_restartable_object(state, entry) do
-          {:restartable, %{} = obj, claim_opts} ->
+          {:restartable, %{} = obj, claim_context} ->
             now = System.system_time(:millisecond)
             gate_first_seen_at = touch_restart_gate_state(state, key, now)
 
@@ -1993,7 +1999,7 @@ defmodule DurableServer.LifecycleManager do
                  local_candidate_batch_size,
                  state.parallel_restart_batch_size
                ) do
-              attempt_restart(state, obj, claim_opts)
+              attempt_restart(state, obj, claim_context)
             else
               :noop
             end
@@ -2176,8 +2182,8 @@ defmodule DurableServer.LifecycleManager do
                   :ok ->
                     # proceed with existing health checks
                     case appears_restartable?(state, meta) do
-                      {:restartable, claim_opts} ->
-                        {:restartable, obj, claim_opts}
+                      {:restartable, claim_context} ->
+                        {:restartable, obj, claim_context}
 
                       :transient ->
                         nil
@@ -2284,12 +2290,12 @@ defmodule DurableServer.LifecycleManager do
       :healthy ->
         false
 
-      {:orphaned, claim_opts} ->
+      {:orphaned, claim_context} ->
         # server is orphaned, check if this node should handle it
-        if orphan_claimable?(meta), do: {:restartable, claim_opts}, else: false
+        if orphan_claimable?(meta), do: {:restartable, claim_context}, else: false
 
       :orphaned ->
-        if orphan_claimable?(meta), do: {:restartable, []}, else: false
+        if orphan_claimable?(meta), do: {:restartable, :check_lock}, else: false
 
       :transient ->
         :transient
@@ -2448,7 +2454,7 @@ defmodule DurableServer.LifecycleManager do
 
           :ok ->
             case appears_restartable?(state, meta) do
-              {:restartable, _claim_opts} ->
+              {:restartable, _claim_context} ->
                 # Now restartable — remove from cache, let async task do fresh GET
                 :ets.delete(state.discovery_skip_table, key)
                 false
@@ -2501,14 +2507,22 @@ defmodule DurableServer.LifecycleManager do
   defp attempt_restart(
          %LifecycleManager{} = state,
          %StoredState{meta: %Meta{} = meta} = stored_state,
-         claim_opts
+         claim_context
        ) do
+    claim_opts = [ttl: restart_claim_ttl_ms(state)]
+
     claim_result =
-      DurableServer.claim_restart_attempt(
-        state.object_store,
-        stored_state,
-        Keyword.merge([ttl: restart_claim_ttl_ms(state)], claim_opts)
-      )
+      case claim_context do
+        :verified_expired_lock ->
+          DurableServer.claim_restart_attempt_with_verified_expired_lock(
+            state.object_store,
+            stored_state,
+            claim_opts
+          )
+
+        :check_lock ->
+          DurableServer.claim_restart_attempt(state.object_store, stored_state, claim_opts)
+      end
 
     report_diagnostic(state.supervisor_name, restart_claim_diag_key(claim_result))
 
@@ -2691,7 +2705,7 @@ defmodule DurableServer.LifecycleManager do
 
       # check if the process lock has expired
       lock_result == :expired ->
-        {:orphaned, [skip_lock_check: true]}
+        {:orphaned, :verified_expired_lock}
 
       # server explicitly marked as crashed
       Meta.crashed?(meta) ->
