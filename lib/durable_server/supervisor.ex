@@ -221,6 +221,8 @@ defmodule DurableServer.Supervisor do
   @shutdown_placement_attempt_wait_timeout :timer.seconds(1)
   @default_placement_timeout :timer.seconds(15)
   @default_start_child_timeout 5_000
+  @already_started_registration_wait_ms 5_000
+  @already_started_registration_poll_ms 100
   @default_discovery_interval_ms 60_000
   @default_initial_discovery_delay_ms {1_000, 6_000}
   @default_discovery_shuffle_batch_size 20_000
@@ -1836,12 +1838,15 @@ defmodule DurableServer.Supervisor do
     When set, if all placement attempts fail, retries with fresh eligible nodes every
     #{@placement_retry_interval}ms until the deadline. Default: `nil` (no retry).
   - `:timeout` - Maximum total time in milliseconds to wait for the process to be
-    found or bootstrapped. Returns `{:error, :timeout}` on expiration. Set to
-    `:infinity` to disable. Default: `#{@default_start_child_timeout}`ms.
+    found or bootstrapped. Returns `{:error, :timeout}` on expiration, unless a
+    live storage lock is found without a reachable Group entry. Set to `:infinity`
+    to disable. Default: `#{@default_start_child_timeout}`ms.
 
   ## Returns
 
   - `{:ok, {pid, meta}}` - Process is running (either found or newly started)
+  - `{:error, {:unreachable, pid}}` - Storage has a live lock for `pid`, but no
+    Group metadata became reachable before the registration-race wait expired
   - `{:error, reason}` - Failed to start the process
 
   ## Examples
@@ -2096,7 +2101,7 @@ defmodule DurableServer.Supervisor do
                   {:ok, {pid, meta}}
 
                 {:error, {:already_started, other}} ->
-                  normalize_already_started_result(supervisor, key, other)
+                  normalize_already_started_result(supervisor, key, other, deadline_ms)
 
                 {:error, reason} ->
                   {:error, reason}
@@ -2118,16 +2123,46 @@ defmodule DurableServer.Supervisor do
     end
   end
 
-  defp normalize_already_started_result(_supervisor, _key, {pid, meta}) when is_pid(pid),
-    do: {:ok, {pid, meta}}
+  defp normalize_already_started_result(_supervisor, _key, {pid, meta}, _deadline_ms)
+       when is_pid(pid),
+       do: {:ok, {pid, meta}}
 
-  defp normalize_already_started_result(supervisor, key, pid) when is_pid(pid) do
+  defp normalize_already_started_result(supervisor, key, pid, deadline_ms) when is_pid(pid) do
+    await_group_registration_or_unreachable(
+      supervisor,
+      key,
+      pid,
+      already_started_registration_deadline(deadline_ms)
+    )
+  end
+
+  defp already_started_registration_deadline(deadline_ms) do
+    registration_deadline =
+      System.monotonic_time(:millisecond) + @already_started_registration_wait_ms
+
+    earlier_deadline(deadline_ms, registration_deadline)
+  end
+
+  defp await_group_registration_or_unreachable(supervisor, key, pid, wait_deadline_ms) do
     case lookup(supervisor, key) do
       {^pid, meta} ->
         {:ok, {pid, meta}}
 
       _ ->
-        {:error, {:already_started, pid}}
+        remaining_ms = remaining_timeout_ms(wait_deadline_ms)
+
+        if remaining_ms == 0 do
+          {:error, {:unreachable, pid}}
+        else
+          sleep_ms =
+            case remaining_ms do
+              :infinity -> @already_started_registration_poll_ms
+              timeout_ms -> min(@already_started_registration_poll_ms, timeout_ms)
+            end
+
+          Process.sleep(sleep_ms)
+          await_group_registration_or_unreachable(supervisor, key, pid, wait_deadline_ms)
+        end
     end
   end
 
@@ -2347,7 +2382,8 @@ defmodule DurableServer.Supervisor do
             stored_object,
             child_spec,
             matching_level,
-            reason
+            reason,
+            deadline
           )
         end
 
@@ -2372,7 +2408,8 @@ defmodule DurableServer.Supervisor do
          stored_object,
          child_spec,
          matching_level,
-         placement_error_reason
+         placement_error_reason,
+         deadline_ms
        ) do
     delays =
       case __get_sticky_placement_for_module__(supervisor, module) do
@@ -2402,7 +2439,7 @@ defmodule DurableServer.Supervisor do
         "Sticky placement time gate passed for #{key} (level=#{matching_level}), falling back to local start"
       )
 
-      fallback_to_local_start(supervisor, child_spec)
+      fallback_to_local_start(supervisor, child_spec, deadline_ms)
     else
       Logger.info(
         "Sticky placement time gate not yet passed for #{key} (level=#{inspect(matching_level)}), " <>
@@ -2413,7 +2450,7 @@ defmodule DurableServer.Supervisor do
     end
   end
 
-  defp fallback_to_local_start(supervisor, child_spec) do
+  defp fallback_to_local_start(supervisor, child_spec, deadline_ms) do
     {_, init_arg, _boot_info} = child_spec
     key = ensure_started_child_key!(init_arg)
 
@@ -2422,7 +2459,7 @@ defmodule DurableServer.Supervisor do
         {:ok, {pid, meta}}
 
       {:error, {:already_started, other}} ->
-        normalize_already_started_result(supervisor, key, other)
+        normalize_already_started_result(supervisor, key, other, deadline_ms)
 
       {:error, reason} ->
         {:error, reason}
@@ -2626,7 +2663,7 @@ defmodule DurableServer.Supervisor do
                 {:ok, {pid, meta}}
 
               {:error, {:already_started, other}} ->
-                normalize_already_started_result(supervisor, key, other)
+                normalize_already_started_result(supervisor, key, other, nil)
 
               {:error, reason} ->
                 {:error, reason}

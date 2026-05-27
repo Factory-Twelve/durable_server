@@ -96,6 +96,75 @@ defmodule DurableServerTest do
     :ets.insert(table, {{:override, key, consistent}, response})
   end
 
+  defp insert_running_lock(table, storage_key, supervisor_name, prefix, key, pid) do
+    node_ref = DurableServer.Supervisor.node_ref(supervisor_name)
+
+    stored_state = %StoredState{
+      vsn: 1,
+      state: %{"count" => 0},
+      meta: %DurableServer.Meta{
+        key: key,
+        prefix: prefix,
+        supervisor: supervisor_name,
+        module: TestServer,
+        status: :running,
+        node_str: to_string(node()),
+        node_ref: node_ref,
+        pid: pid,
+        last_heartbeat_at: System.system_time(:millisecond)
+      }
+    }
+
+    :ets.insert(table, {{:data, storage_key}, %{body: stored_state, etag: "etag-#{key}"}})
+    stored_state
+  end
+
+  defp start_group_registrar(supervisor_name, prefix, key, user_meta) do
+    parent = self()
+
+    pid =
+      spawn_link(fn ->
+        send(parent, {:registrar_ready, self()})
+
+        receive do
+          :register ->
+            :ok =
+              DurableServer.Supervisor.__register_child__(
+                supervisor_name,
+                key,
+                %DurableServer.GroupMeta{
+                  key: key,
+                  module: TestServer,
+                  storage_key: prefix <> key,
+                  node_ref: DurableServer.Supervisor.node_ref(supervisor_name),
+                  start_time: System.system_time(:millisecond),
+                  user_meta: user_meta,
+                  supervisor: supervisor_name
+                }
+              )
+
+            send(parent, {:registrar_registered, self()})
+
+            receive do
+              :stop -> :ok
+            end
+
+          :stop ->
+            :ok
+        end
+      end)
+
+    assert_receive {:registrar_ready, ^pid}
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        send(pid, :stop)
+      end
+    end)
+
+    pid
+  end
+
   defp recorded_get_opts(table, key) do
     table
     |> :ets.tab2list()
@@ -838,6 +907,61 @@ defmodule DurableServerTest do
 
       # Verify it's the same process in the registry
       {^pid1, ^initial_meta} = DurableServer.Supervisor.lookup(supervisor_name, key)
+    end
+
+    test "ensure_started_child waits for raced Group registration before returning", %{
+      prefix: _default_prefix
+    } do
+      {supervisor_name, _supervisor_pid, prefix} =
+        start_test_supervisor(backend: {ConsistencyProbeBackend, owner: self()})
+
+      %{storage_backend: backend} = DurableServer.Supervisor.__get_config__(supervisor_name)
+      table = backend_table(backend)
+      key = "ensure-raced-registration-#{DurableServer.UUID.uuid4()}"
+      storage_key = prefix <> key
+      user_meta = %{source: :group_registration}
+
+      registrar = start_group_registrar(supervisor_name, prefix, key, user_meta)
+      insert_running_lock(table, storage_key, supervisor_name, prefix, key, registrar)
+
+      Task.start(fn ->
+        Process.sleep(100)
+        send(registrar, :register)
+      end)
+
+      assert {:ok, {^registrar, ^user_meta}} =
+               DurableServer.Supervisor.ensure_started_child(
+                 supervisor_name,
+                 {TestServer, key: key, initial_state: %{}},
+                 timeout: 2_000
+               )
+
+      assert_receive {:registrar_registered, ^registrar}, 500
+    end
+
+    test "ensure_started_child returns unreachable when storage lock has no Group registration",
+         %{
+           prefix: _default_prefix
+         } do
+      {supervisor_name, _supervisor_pid, prefix} =
+        start_test_supervisor(backend: {ConsistencyProbeBackend, owner: self()})
+
+      %{storage_backend: backend} = DurableServer.Supervisor.__get_config__(supervisor_name)
+      table = backend_table(backend)
+      key = "ensure-unreachable-lock-#{DurableServer.UUID.uuid4()}"
+      storage_key = prefix <> key
+
+      registrar = start_group_registrar(supervisor_name, prefix, key, %{unused: true})
+      insert_running_lock(table, storage_key, supervisor_name, prefix, key, registrar)
+
+      assert {:error, {:unreachable, ^registrar}} =
+               DurableServer.Supervisor.ensure_started_child(
+                 supervisor_name,
+                 {TestServer, key: key, initial_state: %{}},
+                 timeout: 300
+               )
+
+      assert DurableServer.Supervisor.lookup(supervisor_name, key) == nil
     end
   end
 
