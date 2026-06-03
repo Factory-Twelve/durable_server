@@ -5,6 +5,7 @@ defmodule DurableServerTest do
   alias DurableServer
   alias DurableServer.CircuitBreaker
   alias DurableServer.LifecycleManager
+  alias DurableServer.Meta
   alias DurableServer.StoredState
   alias DurableServer.ObjectStore
   alias DurableServer.Backends.ObjectStore, as: ObjectStoreBackend
@@ -29,8 +30,17 @@ defmodule DurableServerTest do
 
   def atomify_keys(other), do: other
 
-  defp preloaded_child_spec(module, init_arg, preloaded),
-    do: {module, init_arg, %{preloaded: preloaded, is_sticky_local: false}}
+  defp preloaded_child_spec(module, init_arg, %{body: %StoredState{meta: %Meta{}}} = preloaded) do
+    boot_info = %{preloaded: preloaded, is_sticky_local: false}
+
+    boot_info =
+      case preloaded.body.meta.restart_attempt_node do
+        node when is_binary(node) -> Map.put(boot_info, :restart_attempt_node, node)
+        _ -> boot_info
+      end
+
+    {module, init_arg, boot_info}
+  end
 
   defp refute_process_down(pid, timeout \\ 0) when is_pid(pid) do
     ref = Process.monitor(pid)
@@ -249,7 +259,8 @@ defmodule DurableServerTest do
        %{
          state: %{
            table: :ets.new(__MODULE__, [:set, :public]),
-           owner: Map.get(opts, :owner)
+           owner: Map.get(opts, :owner),
+           after_put: Map.get(opts, :after_put)
          }
        }}
     end
@@ -286,23 +297,27 @@ defmodule DurableServerTest do
     end
 
     @impl true
-    def put_object(%{table: table}, key, data, opts) do
-      case Keyword.fetch(opts, :etag) do
-        {:ok, expected_etag} ->
-          case :ets.lookup(table, {:data, key}) do
-            [{{:data, ^key}, %{etag: ^expected_etag}}] ->
-              store_value(table, key, data)
+    def put_object(%{table: table} = state, key, data, opts) do
+      result =
+        case Keyword.fetch(opts, :etag) do
+          {:ok, expected_etag} ->
+            case :ets.lookup(table, {:data, key}) do
+              [{{:data, ^key}, %{etag: ^expected_etag}}] ->
+                store_value(table, key, data)
 
-            [{{:data, ^key}, _value}] ->
-              {:error, :conflict}
+              [{{:data, ^key}, _value}] ->
+                {:error, :conflict}
 
-            [] ->
-              {:error, :not_found}
-          end
+              [] ->
+                {:error, :not_found}
+            end
 
-        :error ->
-          store_value(table, key, data)
-      end
+          :error ->
+            store_value(table, key, data)
+        end
+
+      maybe_after_put(state, key, data, opts, result)
+      result
     end
 
     @impl true
@@ -351,6 +366,13 @@ defmodule DurableServerTest do
       :ets.insert(table, {{:data, key}, %{body: data, etag: etag}})
       {:ok, %{body: data, etag: etag}}
     end
+
+    defp maybe_after_put(%{after_put: after_put} = state, key, data, opts, result)
+         when is_function(after_put, 5) do
+      after_put.(state, key, data, opts, result)
+    end
+
+    defp maybe_after_put(_state, _key, _data, _opts, _result), do: :ok
 
     defp record_get_call(table, key, opts, owner) do
       call_id = System.unique_integer([:positive, :monotonic])
@@ -772,6 +794,17 @@ defmodule DurableServerTest do
       end
     end
 
+    test "ensure_started_child handles ignore return from user init", %{
+      supervisor_name: supervisor_name,
+      prefix: _prefix
+    } do
+      assert :ignore =
+               DurableServer.Supervisor.ensure_started_child(
+                 supervisor_name,
+                 {TestServer, key: "ensure-ignore", initial_state: %{ignore: true}}
+               )
+    end
+
     test "validates start_link arguments require :key field", %{
       supervisor_name: supervisor_name,
       prefix: _prefix
@@ -962,6 +995,64 @@ defmodule DurableServerTest do
                )
 
       assert DurableServer.Supervisor.lookup(supervisor_name, key) == nil
+    end
+
+    test "ensure_started_child performs one final retry when restart claim expires before timeout",
+         %{
+           prefix: _default_prefix
+         } do
+      {supervisor_name, _supervisor_pid, prefix} =
+        start_test_supervisor(backend: {ConsistencyProbeBackend, owner: self()})
+
+      %{storage_backend: backend} = DurableServer.Supervisor.__get_config__(supervisor_name)
+      now = System.system_time(:millisecond)
+      key = "ensure-expired-restart-claim-#{DurableServer.UUID.uuid4()}"
+      node_str = to_string(Node.self())
+      node_ref = DurableServer.Supervisor.node_ref(supervisor_name)
+
+      heartbeat_table = :"durable_server_heartbeats_#{supervisor_name}"
+      :ets.insert(heartbeat_table, {node_str, node_ref, now, %{}, %{}, %{}, nil})
+
+      stored_state = %StoredState{
+        vsn: 1,
+        state: %{"count" => 11},
+        meta: %Meta{
+          key: key,
+          prefix: prefix,
+          supervisor: supervisor_name,
+          module: TestServer,
+          status: :stopped_graceful,
+          permanent: false,
+          node_str: node_str,
+          node_ref: node_ref,
+          pid: self(),
+          last_heartbeat_at: now,
+          restart_attempt_node: node_str,
+          restart_attempt_time: now,
+          restart_attempt_ttl: now + 50
+        }
+      }
+
+      assert {:ok, %{etag: _etag}} =
+               StorageBackend.put_object(backend, prefix <> key, stored_state, [])
+
+      assert {:ok, {pid, _meta}} =
+               DurableServer.Supervisor.ensure_started_child(
+                 supervisor_name,
+                 {TestServer, key: key, initial_state: %{}},
+                 timeout: 500
+               )
+
+      assert GenServer.call(pid, :get_count) == 11
+
+      assert {:ok, %StoredState{meta: %Meta{} = meta}} =
+               DurableServer.fetch_stored_state(backend, %{key: key, prefix: prefix},
+                 consistent: true
+               )
+
+      assert meta.status == :running
+      assert meta.restart_attempt_node == nil
+      assert meta.restart_attempt_ttl == nil
     end
   end
 
@@ -1745,6 +1836,144 @@ defmodule DurableServerTest do
       snapshot = GenServer.call(restarted_pid, :get_snapshot)
       assert is_binary(snapshot.occurred_at)
       assert is_binary(snapshot.nested["occurred_at"])
+    end
+
+    test "rehome_child reserves stopped object before LifecycleManager can claim it" do
+      key = "rehome-race-#{DurableServer.UUID.uuid4()}"
+      owner = self()
+
+      after_put = fn backend_state, storage_key, stored_state, _opts, result ->
+        case {stored_state, result} do
+          {%StoredState{meta: %Meta{status: :stopped_graceful} = meta}, {:ok, %{etag: etag}}} ->
+            if String.ends_with?(storage_key, key) do
+              prefix = String.replace_suffix(storage_key, key, "")
+
+              stored_state = %{
+                stored_state
+                | key: key,
+                  prefix: prefix,
+                  etag: etag,
+                  meta: %{meta | key: key, prefix: prefix}
+              }
+
+              backend = StorageBackend.new(ConsistencyProbeBackend, backend_state)
+              result = DurableServer.claim_restart_attempt(backend, stored_state, ttl: 30_000)
+              send(owner, {:rehome_race_claim_result, result})
+            end
+
+          _ ->
+            :ok
+        end
+      end
+
+      {supervisor_name, _supervisor_pid, prefix} =
+        start_test_supervisor(
+          backend: {ConsistencyProbeBackend, owner: owner, after_put: after_put}
+        )
+
+      {:ok, {pid, _meta}} =
+        DurableServer.Supervisor.start_child(
+          supervisor_name,
+          {TestServer, key: key, initial_state: %{count: 1, custom_opts: %{permanent: true}}},
+          timeout: 10_000
+        )
+
+      assert {:ok, {rehome_pid, _meta}} =
+               DurableServer.Supervisor.rehome_child(
+                 supervisor_name,
+                 {TestServer, key: key, initial_state: %{}},
+                 shutdown_timeout: 5_000
+               )
+
+      assert rehome_pid != pid
+
+      assert_receive {:rehome_race_claim_result, claim_result}, 1_000
+      assert {:error, :already_claimed} = claim_result
+
+      %{storage_backend: backend} = DurableServer.Supervisor.__get_config__(supervisor_name)
+
+      assert {:ok, %StoredState{meta: %Meta{} = meta}} =
+               DurableServer.fetch_stored_state(backend, %{key: key, prefix: prefix},
+                 consistent: true
+               )
+
+      assert meta.status == :running
+      assert meta.restart_attempt_node == nil
+      assert meta.restart_attempt_ttl == nil
+    end
+
+    test "concurrent rehome_child calls singleflight to one stop/start attempt" do
+      key = "rehome-singleflight-#{DurableServer.UUID.uuid4()}"
+      owner = self()
+      gate_table = :ets.new(:rehome_singleflight_gate, [:set, :public])
+
+      after_put = fn _backend_state, storage_key, stored_state, _opts, result ->
+        case {stored_state, result} do
+          {%StoredState{meta: %Meta{status: :stopped_graceful}}, {:ok, %{etag: _etag}}} ->
+            if String.ends_with?(storage_key, key) and :ets.info(gate_table) != :undefined do
+              count =
+                :ets.update_counter(
+                  gate_table,
+                  :stopped_writes,
+                  {2, 1},
+                  {:stopped_writes, 0}
+                )
+
+              if count == 1 do
+                hook_pid = self()
+                send(owner, {:rehome_singleflight_stopped_write, hook_pid})
+
+                receive do
+                  {:release_rehome_singleflight_stopped_write, ^hook_pid} -> :ok
+                after
+                  5_000 -> :ok
+                end
+              end
+            end
+
+          _ ->
+            :ok
+        end
+      end
+
+      {supervisor_name, _supervisor_pid, _prefix} =
+        start_test_supervisor(
+          backend: {ConsistencyProbeBackend, owner: owner, after_put: after_put}
+        )
+
+      {:ok, {pid, _meta}} =
+        DurableServer.Supervisor.start_child(
+          supervisor_name,
+          {TestServer, key: key, initial_state: %{custom_opts: %{permanent: true}}},
+          timeout: 10_000
+        )
+
+      tasks =
+        for _ <- 1..8 do
+          Task.async(fn ->
+            DurableServer.Supervisor.rehome_child(
+              supervisor_name,
+              {TestServer, key: key, initial_state: %{}},
+              shutdown_timeout: 10_000
+            )
+          end)
+        end
+
+      assert_receive {:rehome_singleflight_stopped_write, hook_pid}, 1_000
+      refute_receive {:rehome_singleflight_stopped_write, _other_hook_pid}, 100
+      send(hook_pid, {:release_rehome_singleflight_stopped_write, hook_pid})
+
+      results = Enum.map(tasks, &Task.await(&1, 15_000))
+
+      assert Enum.all?(results, &match?({:ok, {_pid, _meta}}, &1))
+
+      rehome_pids =
+        Enum.map(results, fn {:ok, {rehome_pid, _meta}} -> rehome_pid end)
+        |> Enum.uniq()
+
+      assert [rehome_pid] = rehome_pids
+      assert rehome_pid != pid
+      assert :ets.lookup(gate_table, :stopped_writes) == [{:stopped_writes, 1}]
     end
   end
 

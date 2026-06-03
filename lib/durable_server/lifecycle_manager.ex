@@ -2463,7 +2463,12 @@ defmodule DurableServer.LifecycleManager do
       # because lifecycle manager is only concered with its own local node
       DurableServer.Supervisor.__start_child__(
         state.supervisor_name,
-        {module, init_arg, %{preloaded: preloaded, is_sticky_local: false}},
+        {module, init_arg,
+         %{
+           preloaded: preloaded,
+           is_sticky_local: false,
+           restart_attempt_node: to_string(Node.self())
+         }},
         max_placement_retries: 0,
         timeout: state.restart_start_timeout_ms
       )

@@ -818,6 +818,9 @@ defmodule DurableServer do
             was_permanently_crashed: false,
             user_initiated_stop: nil,
             start_time: nil,
+            restart_attempt_node: nil,
+            restart_attempt_time: nil,
+            restart_attempt_ttl: nil,
             sticky_placement_history: [],
             sticky_placement_history_limit: 5
 
@@ -1121,6 +1124,17 @@ defmodule DurableServer do
        )
        when is_boolean(is_sticky_local) and map_size(boot_info) == 2 and
               map_size(preloaded) == 2,
+       do: preloaded
+
+  defp boot_info_preloaded_object(
+         %{
+           preloaded: %{body: %StoredState{}, etag: _etag} = preloaded,
+           is_sticky_local: is_sticky_local,
+           restart_attempt_node: restart_attempt_node
+         } = boot_info
+       )
+       when is_boolean(is_sticky_local) and is_binary(restart_attempt_node) and
+              map_size(boot_info) == 3 and map_size(preloaded) == 2,
        do: preloaded
 
   defp load_fresh_init_state(module, init_arg, object_store) do
@@ -1585,6 +1599,21 @@ defmodule DurableServer do
     {:stop, reason, :ok, updated_state}
   end
 
+  def handle_call(
+        {@durable, {:stop_for_rehome, restart_attempt_node, restart_attempt_ttl_ms, reason}},
+        _from,
+        %DurableServer{} = state
+      )
+      when is_binary(restart_attempt_node) and is_integer(restart_attempt_ttl_ms) and
+             restart_attempt_ttl_ms > 0 do
+    updated_state =
+      state
+      |> put_restart_attempt(restart_attempt_node, restart_attempt_ttl_ms)
+      |> Map.put(:final_status_set, :stopped_graceful)
+
+    {:stop, reason, :ok, updated_state}
+  end
+
   def handle_call({@durable, :get_etag}, _from, %DurableServer{etag: etag} = state) do
     {:reply, {:ok, etag}, state}
   end
@@ -1753,7 +1782,7 @@ defmodule DurableServer do
           {:ok, %StoredState{} = existing} ->
             %{meta: %Meta{} = meta} = existing
 
-            case active_restart_claim(meta, preloaded_boot, current_node_str) do
+            case active_restart_claim(meta, boot_info, current_node_str) do
               {:claimed, claimant_node} ->
                 {:error, {:restart_claimed, claimant_node}}
 
@@ -2165,9 +2194,24 @@ defmodule DurableServer do
       crash_history: state.crash_history,
       sticky_placement: sticky_placement,
       sticky_placement_history: sticky_placement_history,
+      restart_attempt_node: state.restart_attempt_node,
+      restart_attempt_time: state.restart_attempt_time,
+      restart_attempt_ttl: state.restart_attempt_ttl,
       # store the init_from caller info in meta so we can distinguish automatic vs explicit restarts
       init_from_ref: state.init_from_ref,
       init_from_pid: state.init_from_pid
+    }
+  end
+
+  defp put_restart_attempt(%DurableServer{} = state, restart_attempt_node, ttl_ms)
+       when is_binary(restart_attempt_node) and is_integer(ttl_ms) and ttl_ms > 0 do
+    restart_attempt_time = System.system_time(:millisecond)
+
+    %{
+      state
+      | restart_attempt_node: restart_attempt_node,
+        restart_attempt_time: restart_attempt_time,
+        restart_attempt_ttl: restart_attempt_time + ttl_ms
     }
   end
 
@@ -3219,22 +3263,41 @@ defmodule DurableServer do
     CircuitBreaker.check_global_lock_circuit_breaker(circuit_breaker)
   end
 
-  defp active_restart_claim(%Meta{} = meta, true, current_node_str)
+  defp active_restart_claim(%Meta{} = meta, boot_info, current_node_str)
        when is_binary(current_node_str) do
-    if Meta.currently_restarting?(meta) && meta.restart_attempt_node != current_node_str do
+    if Meta.currently_restarting?(meta) &&
+         not authorized_restart_attempt_boot?(meta, boot_info, current_node_str) do
       {:claimed, meta.restart_attempt_node}
     else
       :ok
     end
   end
 
-  defp active_restart_claim(%Meta{} = meta, false, _current_node_str) do
-    if Meta.currently_restarting?(meta) do
-      {:claimed, meta.restart_attempt_node}
-    else
-      :ok
-    end
+  defp authorized_restart_attempt_boot?(
+         %Meta{restart_attempt_node: restart_attempt_node},
+         boot_info,
+         _current_node_str
+       )
+       when is_binary(restart_attempt_node) do
+    boot_info_restart_attempt_node(boot_info) == restart_attempt_node
   end
+
+  defp authorized_restart_attempt_boot?(%Meta{}, _boot_info, _current_node_str), do: false
+
+  defp boot_info_restart_attempt_node(
+         %{
+           preloaded: %{body: %StoredState{}, etag: _etag} = preloaded,
+           is_sticky_local: is_sticky_local,
+           restart_attempt_node: restart_attempt_node
+         } = boot_info
+       )
+       when is_boolean(is_sticky_local) and is_binary(restart_attempt_node) and
+              map_size(boot_info) == 3 and map_size(preloaded) == 2,
+       do: restart_attempt_node
+
+  defp boot_info_restart_attempt_node(nil), do: nil
+  defp boot_info_restart_attempt_node(%{} = boot_info) when map_size(boot_info) == 0, do: nil
+  defp boot_info_restart_attempt_node(%{}), do: nil
 
   defp maybe_increment_global_lock_failures(%DurableServer{preloaded_boot: true}), do: :ok
 

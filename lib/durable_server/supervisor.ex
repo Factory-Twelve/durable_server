@@ -242,6 +242,7 @@ defmodule DurableServer.Supervisor do
   @placement_node_timeout_cooldown_ms :timer.seconds(15)
   @placement_erpc_timeout_same_region_ms 3_000
   @placement_erpc_timeout_cross_region_ms 8_000
+  @restart_claim_race_poll_ms 100
   @ensure_started_singleflight_wait_timeout_ms :timer.seconds(30)
   @default_max_singleflight_waiters_per_key_module 50_000
   @ekv_backend_option_keys [
@@ -915,10 +916,18 @@ defmodule DurableServer.Supervisor do
   end
 
   defp preloaded_boot_info(body, etag, opts \\ []) do
-    %{
+    boot_info = %{
       preloaded: %{body: body, etag: etag},
       is_sticky_local: Keyword.get(opts, :is_sticky_local, false)
     }
+
+    case Keyword.fetch(opts, :restart_attempt_node) do
+      {:ok, restart_attempt_node} when is_binary(restart_attempt_node) ->
+        Map.put(boot_info, :restart_attempt_node, restart_attempt_node)
+
+      :error ->
+        boot_info
+    end
   end
 
   defp boot_info_preloaded_object(nil), do: nil
@@ -932,6 +941,17 @@ defmodule DurableServer.Supervisor do
        )
        when is_boolean(is_sticky_local) and map_size(boot_info) == 2 and
               map_size(preloaded) == 2,
+       do: preloaded
+
+  defp boot_info_preloaded_object(
+         %{
+           preloaded: %{body: %StoredState{}, etag: _etag} = preloaded,
+           is_sticky_local: is_sticky_local,
+           restart_attempt_node: restart_attempt_node
+         } = boot_info
+       )
+       when is_boolean(is_sticky_local) and is_binary(restart_attempt_node) and
+              map_size(boot_info) == 3 and map_size(preloaded) == 2,
        do: preloaded
 
   defp caller_timeout!(opts) when is_list(opts) do
@@ -1377,28 +1397,41 @@ defmodule DurableServer.Supervisor do
       nil ->
         case LifecycleManager.lookup_node_health(%{supervisor: supervisor, node_str: claim_node}) do
           {:healthy, _node_ref} ->
-            if deadline_exceeded?(deadline_ms) do
-              {:error, :timeout}
-            else
-              wait_ms =
-                case remaining_timeout_ms(deadline_ms) do
-                  :infinity -> 100
-                  timeout_ms -> min(100, max(timeout_ms, 1))
-                end
+            remaining_ms = remaining_timeout_ms(deadline_ms)
 
-              Process.sleep(wait_ms)
+            cond do
+              restart_claim_race_final_retry?(retries, remaining_ms) ->
+                do_start_child(
+                  supervisor,
+                  {module, init_arg, boot_info},
+                  retries + 1,
+                  deadline_ms,
+                  reply_to
+                )
 
-              handle_restart_claim_race(
-                supervisor,
-                module,
-                init_arg,
-                boot_info,
-                key,
-                claim_node,
-                retries,
-                deadline_ms,
-                reply_to
-              )
+              remaining_ms == 0 ->
+                {:error, :timeout}
+
+              true ->
+                wait_ms =
+                  case remaining_ms do
+                    :infinity -> @restart_claim_race_poll_ms
+                    timeout_ms -> min(@restart_claim_race_poll_ms, max(timeout_ms, 1))
+                  end
+
+                Process.sleep(wait_ms)
+
+                handle_restart_claim_race(
+                  supervisor,
+                  module,
+                  init_arg,
+                  boot_info,
+                  key,
+                  claim_node,
+                  retries,
+                  deadline_ms,
+                  reply_to
+                )
             end
 
           unhealthy when unhealthy in [:stale, :unknown] ->
@@ -1432,6 +1465,12 @@ defmodule DurableServer.Supervisor do
       reply_to
     )
   end
+
+  defp restart_claim_race_final_retry?(0, remaining_ms)
+       when is_integer(remaining_ms) and remaining_ms in 1..@restart_claim_race_poll_ms,
+       do: true
+
+  defp restart_claim_race_final_retry?(_retries, _remaining_ms), do: false
 
   defp try_remote_placement(supervisor, {module, init_arg, boot_info} = child_spec, max_retries) do
     key = Keyword.fetch!(init_arg, :key)
@@ -1934,13 +1973,19 @@ defmodule DurableServer.Supervisor do
     else
       singleflight_wait_timeout_ms = ensure_started_singleflight_wait_timeout_ms(deadline_ms)
 
-      case with_ensure_started_singleflight(
+      case with_supervisor_singleflight(
              supervisor,
              singleflight_key,
              singleflight_wait_timeout_ms,
              fn ->
                do_ensure_started_child(supervisor, module, key, child_spec, opts, deadline_ms)
-             end
+             end,
+             %{
+               leader: :ensure_started_singleflight_leader,
+               waiter: :ensure_started_singleflight_waiter,
+               owner_down: :ensure_started_singleflight_owner_down,
+               wait_timeout: :ensure_started_singleflight_wait_timeout
+             }
            ) do
         {:result, result} ->
           result
@@ -2103,6 +2148,9 @@ defmodule DurableServer.Supervisor do
                 {:error, {:already_started, other}} ->
                   normalize_already_started_result(supervisor, key, other, deadline_ms)
 
+                :ignore ->
+                  :ignore
+
                 {:error, reason} ->
                   {:error, reason}
               end
@@ -2166,15 +2214,21 @@ defmodule DurableServer.Supervisor do
     end
   end
 
-  defp with_ensure_started_singleflight(supervisor, singleflight_key, wait_timeout_ms, fun)
+  defp with_supervisor_singleflight(
+         supervisor,
+         singleflight_key,
+         wait_timeout_ms,
+         fun,
+         diagnostics
+       )
        when is_atom(supervisor) and is_integer(wait_timeout_ms) and wait_timeout_ms > 0 and
-              is_function(fun, 0) do
+              is_function(fun, 0) and is_map(diagnostics) do
     owner_registry = ensure_started_singleflight_registry_name(supervisor)
     waiters_registry = ensure_started_singleflight_waiters_registry_name(supervisor)
 
     case Registry.register(owner_registry, singleflight_key, :singleflight_owner) do
       {:ok, _owner_pid} ->
-        report_placement_diagnostic(supervisor, :ensure_started_singleflight_leader)
+        report_singleflight_diagnostic(supervisor, diagnostics, :leader)
 
         try do
           result = fun.()
@@ -2191,15 +2245,16 @@ defmodule DurableServer.Supervisor do
         end
 
       {:error, {:already_registered, owner_pid}} ->
-        report_placement_diagnostic(supervisor, :ensure_started_singleflight_waiter)
+        report_singleflight_diagnostic(supervisor, diagnostics, :waiter)
 
-        wait_for_ensure_started_singleflight_owner(
+        wait_for_supervisor_singleflight_owner(
           supervisor,
           owner_registry,
           waiters_registry,
           singleflight_key,
           owner_pid,
-          wait_timeout_ms
+          wait_timeout_ms,
+          diagnostics
         )
     end
   rescue
@@ -2208,16 +2263,18 @@ defmodule DurableServer.Supervisor do
       {:result, fun.()}
   end
 
-  defp wait_for_ensure_started_singleflight_owner(
+  defp wait_for_supervisor_singleflight_owner(
          supervisor,
          owner_registry,
          waiters_registry,
          singleflight_key,
          owner_pid,
-         wait_timeout_ms
+         wait_timeout_ms,
+         diagnostics
        )
        when is_atom(supervisor) and is_atom(owner_registry) and is_atom(waiters_registry) and
-              is_pid(owner_pid) and is_integer(wait_timeout_ms) and wait_timeout_ms > 0 do
+              is_pid(owner_pid) and is_integer(wait_timeout_ms) and wait_timeout_ms > 0 and
+              is_map(diagnostics) do
     if owner_pid == self() do
       :retry
     else
@@ -2245,18 +2302,12 @@ defmodule DurableServer.Supervisor do
                       {:result, singleflight_result}
 
                     {:DOWN, ^monitor_ref, :process, ^owner_pid, _reason} ->
-                      report_placement_diagnostic(
-                        supervisor,
-                        :ensure_started_singleflight_owner_down
-                      )
+                      report_singleflight_diagnostic(supervisor, diagnostics, :owner_down)
 
                       :retry
                   after
                     wait_timeout_ms ->
-                      report_placement_diagnostic(
-                        supervisor,
-                        :ensure_started_singleflight_wait_timeout
-                      )
+                      report_singleflight_diagnostic(supervisor, diagnostics, :wait_timeout)
 
                       case Registry.lookup(owner_registry, singleflight_key) do
                         [] ->
@@ -2284,13 +2335,14 @@ defmodule DurableServer.Supervisor do
 
           case result do
             {:follow_owner, new_owner_pid} ->
-              wait_for_ensure_started_singleflight_owner(
+              wait_for_supervisor_singleflight_owner(
                 supervisor,
                 owner_registry,
                 waiters_registry,
                 singleflight_key,
                 new_owner_pid,
-                wait_timeout_ms
+                wait_timeout_ms,
+                diagnostics
               )
 
             other ->
@@ -2300,6 +2352,17 @@ defmodule DurableServer.Supervisor do
     end
   rescue
     ArgumentError -> :retry
+  end
+
+  defp report_singleflight_diagnostic(supervisor, diagnostics, key)
+       when is_atom(supervisor) and is_map(diagnostics) and is_atom(key) do
+    case Map.fetch(diagnostics, key) do
+      {:ok, diagnostic_key} when is_atom(diagnostic_key) ->
+        report_placement_diagnostic(supervisor, diagnostic_key)
+
+      _ ->
+        :ok
+    end
   end
 
   defp dispatch_ensure_started_singleflight_result(waiters_registry, singleflight_key, result)
@@ -2514,6 +2577,30 @@ defmodule DurableServer.Supervisor do
     end
   end
 
+  defp terminate_child_for_rehome(
+         supervisor_name,
+         pid,
+         restart_attempt_node,
+         ttl_ms,
+         timeout_ms
+       )
+       when is_atom(supervisor_name) and is_pid(pid) and is_binary(restart_attempt_node) and
+              is_integer(ttl_ms) and ttl_ms > 0 and is_integer(timeout_ms) and timeout_ms > 0 do
+    Logger.debug(fn ->
+      "terminating #{inspect(pid)} for rehome under #{inspect(supervisor_name)}"
+    end)
+
+    try do
+      GenServer.call(
+        pid,
+        {@durable, {:stop_for_rehome, restart_attempt_node, ttl_ms, :normal}},
+        timeout_ms
+      )
+    catch
+      :exit, reason -> {:error, {:shutdown_call_failed, reason}}
+    end
+  end
+
   @doc """
   Rehomes a DurableServer child to a different node, bypassing sticky placement.
 
@@ -2552,132 +2639,230 @@ defmodule DurableServer.Supervisor do
   """
   def rehome_child(supervisor, {module, init_arg}, opts \\ []) do
     init_arg = validate_child_init_arg!(init_arg, "rehome_child")
-    child_spec = {module, init_arg, nil}
 
     opts = Keyword.validate!(opts, [:target_node, :force, :shutdown_timeout])
     shutdown_timeout = Keyword.get(opts, :shutdown_timeout, 15_000)
-
     key = Keyword.fetch!(init_arg, :key)
+    singleflight_key = {:rehome_child, key, module}
+    wait_timeout_ms = max(shutdown_timeout, @ensure_started_singleflight_wait_timeout_ms)
 
+    case with_supervisor_singleflight(
+           supervisor,
+           singleflight_key,
+           wait_timeout_ms,
+           fn -> do_rehome_child(supervisor, {module, init_arg, nil}, opts, key) end,
+           %{}
+         ) do
+      {:result, result} ->
+        result
+
+      :retry ->
+        rehome_child(supervisor, {module, init_arg}, opts)
+    end
+  end
+
+  defp do_rehome_child(supervisor, {module, init_arg, nil} = child_spec, opts, key)
+       when is_atom(supervisor) and is_atom(module) and is_list(init_arg) and is_list(opts) and
+              is_binary(key) do
+    shutdown_timeout = Keyword.get(opts, :shutdown_timeout, 15_000)
     target_node = Keyword.get(opts, :target_node)
     force = Keyword.get(opts, :force, true)
+    reservation_node = to_string(Node.self())
+    reservation_ttl_ms = rehome_reservation_ttl_ms(supervisor)
+    running_entry = lookup(supervisor, key)
 
     # Step 1: Terminate existing process if running
-    case lookup(supervisor, key) do
-      {pid, _meta} ->
-        Logger.info("Rehoming #{key}: terminating on #{node(pid)}")
-        monitor_ref = Process.monitor(pid)
-        terminate_child(supervisor, pid)
+    require_reservation? = match?({_pid, _meta}, running_entry)
 
-        # Wait for the process to terminate
-        receive do
-          {:DOWN, ^monitor_ref, :process, ^pid, _reason} ->
-            :ok
-        after
-          shutdown_timeout ->
-            # Process didn't terminate within timeout, demonitor and continue anyway
-            Process.demonitor(monitor_ref, [:flush])
-            Logger.warning("Process #{inspect(pid)} for #{key} did not terminate within 5s")
-            :ok
-        end
+    stop_result =
+      case running_entry do
+        {pid, _meta} ->
+          # Reserve restart ownership in the same final storage write that makes
+          # the stopped object visible, otherwise LifecycleManager can claim it.
+          Logger.info("Rehoming #{key}: terminating on #{node(pid)}")
 
-      nil ->
-        :ok
-    end
+          case terminate_child_for_rehome(
+                 supervisor,
+                 pid,
+                 reservation_node,
+                 reservation_ttl_ms,
+                 shutdown_timeout
+               ) do
+            :ok ->
+              monitor_ref = Process.monitor(pid)
 
-    # Step 2: Start on target node or find best placement
-    cond do
-      target_node != nil ->
-        # Explicit target node specified
-        Logger.info("Rehoming #{key}: placing on specified target #{inspect(target_node)}")
-        erpc_timeout_ms = placement_erpc_timeout_ms(supervisor, target_node)
-        {remote_child_spec, remote_opts} = remote_start_child_args(child_spec)
+              # Wait for the process to terminate
+              receive do
+                {:DOWN, ^monitor_ref, :process, ^pid, _reason} ->
+                  :ok
+              after
+                shutdown_timeout ->
+                  Process.demonitor(monitor_ref, [:flush])
 
-        try do
-          result =
-            safe_erpc_call(
-              target_node,
-              __MODULE__,
-              :__start_child__,
-              [
-                supervisor,
-                remote_child_spec,
-                remote_opts
-              ],
-              erpc_timeout_ms
-            )
+                  Logger.warning(
+                    "Process #{inspect(pid)} for #{key} did not terminate within #{shutdown_timeout}ms"
+                  )
 
-          case result do
-            {:ok, {pid, meta}} ->
-              Logger.info("Successfully rehomed #{key} to #{inspect(target_node)}")
-              {:ok, {pid, meta}}
+                  {:error, :shutdown_timeout}
+              end
 
-            {:error, reason} ->
-              Logger.error(
-                "Failed to rehome #{key} to #{inspect(target_node)}: #{inspect(reason)}"
+            {:error, _reason} = error ->
+              error
+          end
+
+        nil ->
+          :ok
+      end
+
+    with :ok <- stop_result,
+         {:ok, child_spec} <-
+           rehome_child_spec_with_reservation(
+             supervisor,
+             child_spec,
+             key,
+             reservation_node,
+             require_reservation?
+           ) do
+      # Step 2: Start on target node or find best placement
+      cond do
+        target_node != nil ->
+          # Explicit target node specified
+          Logger.info("Rehoming #{key}: placing on specified target #{inspect(target_node)}")
+          erpc_timeout_ms = placement_erpc_timeout_ms(supervisor, target_node)
+          {remote_child_spec, remote_opts} = remote_start_child_args(child_spec)
+
+          try do
+            result =
+              safe_erpc_call(
+                target_node,
+                __MODULE__,
+                :__start_child__,
+                [
+                  supervisor,
+                  remote_child_spec,
+                  remote_opts
+                ],
+                erpc_timeout_ms
               )
 
-              {:error, reason}
-          end
-        catch
-          :throw, {:error, :not_ready} ->
-            Logger.error(
-              "Node #{inspect(target_node)} not ready (still starting up) for rehoming #{key}"
-            )
-
-            {:error, :not_ready}
-
-          :error, {:erpc, erpc_reason} ->
-            if erpc_reason in [:timeout, :noconnection] do
-              mark_placement_node_timeout(supervisor, target_node)
-            end
-
-            Logger.error("ERPC to #{inspect(target_node)} failed: #{inspect(erpc_reason)}")
-            {:error, {:erpc, erpc_reason}}
-        end
-
-      force ->
-        # Force placement ignoring sticky - try remote placement across all eligible nodes
-        Logger.info("Rehoming #{key}: finding best available node (ignoring sticky placement)")
-
-        eligible_nodes =
-          LifecycleManager.find_eligible_nodes(supervisor, module,
-            limit: 3,
-            # Pass nil for both to ignore sticky placement
-            key: nil,
-            sticky_placement: nil
-          )
-          |> prioritize_placement_nodes(supervisor, 3)
-
-        case eligible_nodes do
-          [] ->
-            # No remote nodes, try local
-            Logger.info("No remote nodes available, trying local for rehoming #{key}")
-
-            case __start_child__(
-                   supervisor,
-                   child_spec,
-                   max_placement_retries: 0
-                 ) do
+            case result do
               {:ok, {pid, meta}} ->
+                Logger.info("Successfully rehomed #{key} to #{inspect(target_node)}")
                 {:ok, {pid, meta}}
 
-              {:error, {:already_started, other}} ->
-                normalize_already_started_result(supervisor, key, other, nil)
-
               {:error, reason} ->
+                Logger.error(
+                  "Failed to rehome #{key} to #{inspect(target_node)}: #{inspect(reason)}"
+                )
+
                 {:error, reason}
             end
+          catch
+            :throw, {:error, :not_ready} ->
+              Logger.error(
+                "Node #{inspect(target_node)} not ready (still starting up) for rehoming #{key}"
+              )
 
-          nodes ->
-            try_nodes(supervisor, child_spec, nodes)
+              {:error, :not_ready}
+
+            :error, {:erpc, erpc_reason} ->
+              if erpc_reason in [:timeout, :noconnection] do
+                mark_placement_node_timeout(supervisor, target_node)
+              end
+
+              Logger.error("ERPC to #{inspect(target_node)} failed: #{inspect(erpc_reason)}")
+              {:error, {:erpc, erpc_reason}}
+          end
+
+        force ->
+          # Force placement ignoring sticky - try remote placement across all eligible nodes
+          Logger.info("Rehoming #{key}: finding best available node (ignoring sticky placement)")
+
+          eligible_nodes =
+            LifecycleManager.find_eligible_nodes(supervisor, module,
+              limit: 3,
+              # Pass nil for both to ignore sticky placement
+              key: nil,
+              sticky_placement: nil
+            )
+            |> prioritize_placement_nodes(supervisor, 3)
+
+          case eligible_nodes do
+            [] ->
+              # No remote nodes, try local
+              Logger.info("No remote nodes available, trying local for rehoming #{key}")
+
+              case __start_child__(
+                     supervisor,
+                     child_spec,
+                     max_placement_retries: 0
+                   ) do
+                {:ok, {pid, meta}} ->
+                  {:ok, {pid, meta}}
+
+                {:error, {:already_started, other}} ->
+                  normalize_already_started_result(supervisor, key, other, nil)
+
+                {:error, reason} ->
+                  {:error, reason}
+              end
+
+            nodes ->
+              try_nodes(supervisor, child_spec, nodes)
+          end
+
+        true ->
+          # Normal ensure_started logic (respects sticky)
+          Logger.info("Rehoming #{key}: using normal placement logic")
+          __ensure_started_child__(supervisor, child_spec)
+      end
+    end
+  end
+
+  defp rehome_reservation_ttl_ms(supervisor) when is_atom(supervisor) do
+    %{restart_start_timeout_ms: restart_start_timeout_ms} = __get_config__(supervisor)
+    LifecycleManager.__restart_claim_ttl_ms__(restart_start_timeout_ms)
+  end
+
+  defp rehome_child_spec_with_reservation(
+         supervisor,
+         {module, init_arg, _boot_info},
+         key,
+         reservation_node,
+         require_reservation?
+       )
+       when is_atom(supervisor) and is_binary(key) and is_binary(reservation_node) and
+              is_boolean(require_reservation?) do
+    %{storage_backend: storage_backend, prefix: prefix} = __get_config__(supervisor)
+
+    case DurableServer.fetch_stored_state(storage_backend, %{key: key, prefix: prefix},
+           consistent: true
+         ) do
+      {:ok, %StoredState{meta: %Meta{} = meta, etag: etag} = stored_state} ->
+        if require_reservation? and not rehome_reservation_matches?(meta, reservation_node) do
+          {:error,
+           {:rehome_reservation_lost,
+            %{
+              restart_attempt_node: meta.restart_attempt_node,
+              restart_attempt_ttl: meta.restart_attempt_ttl
+            }}}
+        else
+          {:ok,
+           {module, init_arg,
+            preloaded_boot_info(stored_state, etag, restart_attempt_node: reservation_node)}}
         end
 
-      true ->
-        # Normal ensure_started logic (respects sticky)
-        Logger.info("Rehoming #{key}: using normal placement logic")
-        __ensure_started_child__(supervisor, child_spec)
+      {:error, :not_found} when not require_reservation? ->
+        {:ok, {module, init_arg, nil}}
+
+      {:error, reason} ->
+        {:error, reason}
     end
+  end
+
+  defp rehome_reservation_matches?(%Meta{} = meta, reservation_node)
+       when is_binary(reservation_node) do
+    Meta.currently_restarting?(meta) and meta.restart_attempt_node == reservation_node
   end
 
   @doc """
