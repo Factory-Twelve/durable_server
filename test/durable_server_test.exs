@@ -1,5 +1,6 @@
 defmodule DurableServerTest do
   use ExUnit.Case, async: true
+  import ExUnit.CaptureLog
   import DurableServer.TestHelper
 
   alias DurableServer
@@ -803,6 +804,35 @@ defmodule DurableServerTest do
                  supervisor_name,
                  {TestServer, key: "ensure-ignore", initial_state: %{ignore: true}}
                )
+    end
+
+    test "explicit local starts reject draining node before spawning a child", %{
+      supervisor_name: supervisor_name,
+      prefix: _prefix
+    } do
+      table_name = DurableServer.Supervisor.__ets_table_name__(supervisor_name)
+      :ets.insert(table_name, {:shutting_down, true})
+
+      log =
+        capture_log([level: :info], fn ->
+          assert {:error, {:capacity_limit, :node_shutting_down}} =
+                   DurableServer.Supervisor.start_child(
+                     supervisor_name,
+                     {TestServer,
+                      key: "draining-start-#{DurableServer.UUID.uuid4()}", initial_state: %{}},
+                     max_placement_retries: 0
+                   )
+
+          assert {:error, {:capacity_limit, :node_shutting_down}} =
+                   DurableServer.Supervisor.ensure_started_child(
+                     supervisor_name,
+                     {TestServer,
+                      key: "draining-ensure-#{DurableServer.UUID.uuid4()}", initial_state: %{}},
+                     local_only: true
+                   )
+        end)
+
+      refute log =~ "DurableServer node shutting down - Cannot start"
     end
 
     test "validates start_link arguments require :key field", %{

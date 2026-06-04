@@ -1,3 +1,6 @@
+## 0.1.4 (2026-06-04)
+- Reject explicit local `start_child/3` and `ensure_started_child/3` attempts before spawning a child when the local supervisor is draining.
+
 ## 0.1.3 (2026-06-03)
 - Return `{:error, {:unreachable, pid}}` from `ensure_started_child/2` when storage shows a live owner but Group metadata is unavailable.
 - Avoid an extra storage read on restart paths by reusing preloaded object data.

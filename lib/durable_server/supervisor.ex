@@ -1041,7 +1041,7 @@ defmodule DurableServer.Supervisor do
           if Process.alive?(pid) do
             {:error, {:already_started, {pid, meta}}}
           else
-            do_start_child_inner(
+            do_start_child_after_local_capacity_check(
               supervisor,
               module,
               init_arg,
@@ -1058,7 +1058,7 @@ defmodule DurableServer.Supervisor do
           {:error, {:already_started, {pid, meta}}}
 
         nil ->
-          do_start_child_inner(
+          do_start_child_after_local_capacity_check(
             supervisor,
             module,
             init_arg,
@@ -1071,6 +1071,50 @@ defmodule DurableServer.Supervisor do
       end
     end
   end
+
+  defp do_start_child_after_local_capacity_check(
+         supervisor,
+         module,
+         init_arg,
+         boot_info,
+         key,
+         retries,
+         deadline_ms,
+         reply_to
+       ) do
+    # Reject before spawning a local child when this node is draining.
+    case check_local_start_capacity(supervisor, module, boot_info) do
+      :ok ->
+        do_start_child_inner(
+          supervisor,
+          module,
+          init_arg,
+          boot_info,
+          key,
+          retries,
+          deadline_ms,
+          reply_to
+        )
+
+      {:error, {:capacity_limit, _reason}} = error ->
+        error
+    end
+  end
+
+  defp check_local_start_capacity(supervisor, module, boot_info) do
+    case LifecycleManager.check_capacity(supervisor, module, local_start_capacity_opts(boot_info)) do
+      :ok -> :ok
+      {:error, {:limit_reached, reason, _details}} -> {:error, {:capacity_limit, reason}}
+    end
+  end
+
+  defp local_start_capacity_opts(%{
+         preloaded: %{body: %StoredState{}, etag: _etag},
+         is_sticky_local: true
+       }),
+       do: [bypass_disk_check: true]
+
+  defp local_start_capacity_opts(_boot_info), do: []
 
   defp do_start_child_inner(
          supervisor,
