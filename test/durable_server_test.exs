@@ -577,6 +577,62 @@ defmodule DurableServerTest do
     end
   end
 
+  defmodule HandleSyncTestServer do
+    use DurableServer, vsn: 1
+
+    def dump_state(state), do: Map.take(state, [:key, :count, :auto_sync?])
+
+    def load_state(_old_vsn, persisted_state) do
+      persisted_state
+      |> DurableServerTest.atomify_keys()
+      |> Map.put_new(:count, 0)
+      |> Map.put(:test_pid, nil)
+      |> Map.put(:sync_count, 0)
+    end
+
+    def init(init_state, info) do
+      {:ok,
+       %{
+         key: info.key,
+         count: Map.get(init_state, :count, 0),
+         test_pid: Map.get(init_state, :test_pid),
+         sync_count: 0,
+         auto_sync?: Map.get(init_state, :auto_sync?, false)
+       }, auto_sync: Map.get(init_state, :auto_sync?, false)}
+    end
+
+    def handle_sync(old_state, new_state) do
+      if is_pid(new_state.test_pid) do
+        send(new_state.test_pid, {:handle_sync, old_state, new_state})
+        {:ok, %{new_state | sync_count: new_state.sync_count + 1}}
+      else
+        {:ok, new_state}
+      end
+    end
+
+    def handle_call({:set_test_pid, pid}, _from, state) do
+      {:reply, :ok, %{state | test_pid: pid}}
+    end
+
+    def handle_call(:sync_same, _from, state) do
+      {:reply, :ok, state, :sync}
+    end
+
+    def handle_call(:increment_sync, _from, %{count: count} = state) do
+      new_state = %{state | count: count + 1}
+      {:reply, count + 1, new_state, :sync}
+    end
+
+    def handle_call(:increment_auto, _from, %{count: count} = state) do
+      new_state = %{state | count: count + 1}
+      {:reply, count + 1, new_state}
+    end
+
+    def handle_call(:get_state, _from, state) do
+      {:reply, state, state}
+    end
+  end
+
   defmodule PeriodicSyncServer do
     use DurableServer,
       vsn: 1
@@ -1583,6 +1639,68 @@ defmodule DurableServerTest do
       # For now, verify the server continues operating
       assert GenServer.call(pid, :increment_and_sync) == 1
       assert GenServer.call(pid, :get_count) == 1
+    end
+  end
+
+  describe "handle_sync callback" do
+    test "runs inline after an explicit sync writes state and skips noop syncs", %{
+      supervisor_name: supervisor_name,
+      prefix: prefix
+    } do
+      key = "handle-sync-explicit-#{DurableServer.UUID.uuid4()}"
+
+      {:ok, {pid, _meta}} =
+        DurableServer.Supervisor.start_child(
+          supervisor_name,
+          {HandleSyncTestServer, key: key, initial_state: %{count: 0}}
+        )
+
+      assert :ok = GenServer.call(pid, {:set_test_pid, self()})
+
+      assert :ok = GenServer.call(pid, :sync_same)
+      refute_receive {:handle_sync, _old_state, _new_state}, 100
+
+      assert 1 = GenServer.call(pid, :increment_sync)
+      assert_receive {:handle_sync, old_state, new_state}, 1_000
+      assert old_state.count == 0
+      assert new_state.count == 1
+      assert new_state.sync_count == 0
+
+      assert %{count: 1, sync_count: 1} = GenServer.call(pid, :get_state)
+
+      assert :ok = GenServer.call(pid, :sync_same)
+      refute_receive {:handle_sync, _old_state, _new_state}, 100
+
+      store = test_object_store()
+      {:ok, persisted_data} = DurableServer.fetch_stored_state(store, %{key: key, prefix: prefix})
+      persisted_state = atomify_keys(persisted_data.state)
+
+      assert persisted_state.count == 1
+      refute Map.has_key?(persisted_state, :sync_count)
+      refute Map.has_key?(persisted_state, :test_pid)
+    end
+
+    test "runs after auto_sync writes state with the pre-callback state", %{
+      supervisor_name: supervisor_name
+    } do
+      key = "handle-sync-auto-#{DurableServer.UUID.uuid4()}"
+
+      {:ok, {pid, _meta}} =
+        DurableServer.Supervisor.start_child(
+          supervisor_name,
+          {HandleSyncTestServer, key: key, initial_state: %{count: 0, auto_sync?: true}}
+        )
+
+      assert :ok = GenServer.call(pid, {:set_test_pid, self()})
+      refute_receive {:handle_sync, _old_state, _new_state}, 100
+
+      assert 1 = GenServer.call(pid, :increment_auto)
+      assert_receive {:handle_sync, old_state, new_state}, 1_000
+      assert old_state.count == 0
+      assert new_state.count == 1
+      assert new_state.sync_count == 0
+
+      assert %{count: 1, sync_count: 1} = GenServer.call(pid, :get_state)
     end
   end
 

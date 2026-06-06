@@ -676,6 +676,32 @@ defmodule DurableServer do
               | {:stop, :permanent, new_state}
             when new_state: term()
 
+  @doc """
+  Optional callback invoked inline after DurableServer successfully writes state
+  to the configured storage backend.
+
+  `handle_sync/2` only runs after an actual backend write. It is not called when
+  a sync request noops because the dumped user state is unchanged and no metadata
+  override forced a write.
+
+  The callback receives the user state before the callback that triggered the
+  sync and the user state that was just persisted. The returned state updates
+  the in-memory process state only; it is not included in the already-completed
+  storage write. If you return changes that affect `dump_state/1`, they will be
+  eligible for a later sync.
+
+  ## Examples
+
+      def handle_sync(old_state, new_state) do
+        if old_state.count != new_state.count do
+          Logger.info("persisted count=\#{new_state.count}")
+        end
+
+        {:ok, new_state}
+      end
+  """
+  @callback handle_sync(old_state :: map(), new_state :: map()) :: {:ok, map()}
+
   @callback terminate(reason :: term(), state :: term()) :: term()
 
   @doc """
@@ -780,6 +806,7 @@ defmodule DurableServer do
                       handle_cast: 2,
                       handle_info: 2,
                       handle_continue: 2,
+                      handle_sync: 2,
                       terminate: 2,
                       after_terminate: 2,
                       code_change: 3
@@ -885,6 +912,10 @@ defmodule DurableServer do
         {:noreply, state}
       end
 
+      def handle_sync(_old_state, new_state) do
+        {:ok, new_state}
+      end
+
       def terminate(_reason, _state) do
         :ok
       end
@@ -914,6 +945,7 @@ defmodule DurableServer do
                      handle_cast: 2,
                      handle_info: 2,
                      handle_continue: 2,
+                     handle_sync: 2,
                      terminate: 2,
                      after_terminate: 2,
                      code_change: 3
@@ -2312,20 +2344,26 @@ defmodule DurableServer do
   defp process_callback_result(result, %__MODULE__{} = state) do
     case result do
       {:reply, reply, new_user_state} ->
+        old_user_state = state.user_state
+
         new_state =
           state
           |> update_state(new_user_state)
-          |> auto_sync_to_storage()
+          |> auto_sync_to_storage(old_user_state)
 
         {:reply, reply, new_state}
 
       # Handle action + options tuple.
       {:reply, reply, new_user_state, action, opts}
       when (is_atom(action) or is_tuple(action)) and is_list(opts) ->
+        old_user_state = state.user_state
         {updated_state, sync?} = apply_callback_options(state, opts)
 
-        {final_state, final_action} = handle_action(updated_state, new_user_state, action)
-        final_state = maybe_sync_with_option(final_state, sync? and not sync_action?(action))
+        {final_state, final_action} =
+          handle_action(updated_state, new_user_state, action, old_user_state)
+
+        final_state =
+          maybe_sync_with_option(final_state, sync? and not sync_action?(action), old_user_state)
 
         if final_action do
           {:reply, reply, final_state, final_action}
@@ -2334,17 +2372,19 @@ defmodule DurableServer do
         end
 
       {:reply, reply, new_user_state, opts} when is_list(opts) ->
+        old_user_state = state.user_state
         {updated_state, sync?} = apply_callback_options(state, opts)
 
         new_state =
           updated_state
           |> update_state(new_user_state)
-          |> maybe_sync_or_auto_sync(sync?)
+          |> maybe_sync_or_auto_sync(sync?, old_user_state)
 
         {:reply, reply, new_state}
 
       {:reply, reply, new_user_state, action} when is_atom(action) or is_tuple(action) ->
-        {final_state, final_action} = handle_action(state, new_user_state, action)
+        {final_state, final_action} =
+          handle_action(state, new_user_state, action, state.user_state)
 
         if final_action do
           {:reply, reply, final_state, final_action}
@@ -2353,17 +2393,23 @@ defmodule DurableServer do
         end
 
       {:noreply, new_user_state} ->
+        old_user_state = state.user_state
+
         {:noreply,
          state
          |> update_state(new_user_state)
-         |> auto_sync_to_storage()}
+         |> auto_sync_to_storage(old_user_state)}
 
       {:noreply, new_user_state, action, opts}
       when (is_atom(action) or is_tuple(action)) and is_list(opts) ->
+        old_user_state = state.user_state
         {updated_state, sync?} = apply_callback_options(state, opts)
 
-        {final_state, final_action} = handle_action(updated_state, new_user_state, action)
-        final_state = maybe_sync_with_option(final_state, sync? and not sync_action?(action))
+        {final_state, final_action} =
+          handle_action(updated_state, new_user_state, action, old_user_state)
+
+        final_state =
+          maybe_sync_with_option(final_state, sync? and not sync_action?(action), old_user_state)
 
         if final_action do
           {:noreply, final_state, final_action}
@@ -2372,17 +2418,19 @@ defmodule DurableServer do
         end
 
       {:noreply, new_user_state, opts} when is_list(opts) ->
+        old_user_state = state.user_state
         {updated_state, sync?} = apply_callback_options(state, opts)
 
         new_state =
           updated_state
           |> update_state(new_user_state)
-          |> maybe_sync_or_auto_sync(sync?)
+          |> maybe_sync_or_auto_sync(sync?, old_user_state)
 
         {:noreply, new_state}
 
       {:noreply, new_user_state, action} when is_atom(action) or is_tuple(action) ->
-        {final_state, final_action} = handle_action(state, new_user_state, action)
+        {final_state, final_action} =
+          handle_action(state, new_user_state, action, state.user_state)
 
         if final_action do
           {:noreply, final_state, final_action}
@@ -2548,15 +2596,15 @@ defmodule DurableServer do
     end
   end
 
-  defp handle_action(%__MODULE__{} = state, new_user_state, action) do
+  defp handle_action(%__MODULE__{} = state, new_user_state, action, old_user_state) do
     state = update_state(state, new_user_state)
 
     case action do
       :sync ->
-        {do_sync(state), nil}
+        {do_sync(state, nil, old_user_state), nil}
 
       {:sync, %{} = metadata} ->
-        {do_sync(state, metadata), nil}
+        {do_sync(state, metadata, old_user_state), nil}
 
       other_action ->
         # handle timeout, hibernate, continue actions
@@ -2591,17 +2639,24 @@ defmodule DurableServer do
   defp sync_action?({:sync, %{} = _metadata}), do: true
   defp sync_action?(_), do: false
 
-  defp maybe_sync_or_auto_sync(%__MODULE__{} = state, true), do: do_sync(state)
-  defp maybe_sync_or_auto_sync(%__MODULE__{} = state, false), do: auto_sync_to_storage(state)
+  defp maybe_sync_or_auto_sync(%__MODULE__{} = state, true, old_user_state),
+    do: do_sync(state, nil, old_user_state)
 
-  defp maybe_sync_with_option(%__MODULE__{} = state, true), do: do_sync(state)
-  defp maybe_sync_with_option(%__MODULE__{} = state, false), do: state
+  defp maybe_sync_or_auto_sync(%__MODULE__{} = state, false, old_user_state),
+    do: auto_sync_to_storage(state, old_user_state)
 
-  defp do_sync(%__MODULE__{} = state, metadata \\ nil) do
+  defp maybe_sync_with_option(%__MODULE__{} = state, true, old_user_state),
+    do: do_sync(state, nil, old_user_state)
+
+  defp maybe_sync_with_option(%__MODULE__{} = state, false, _old_user_state), do: state
+
+  defp do_sync(%__MODULE__{} = state, metadata, old_user_state) do
+    old_user_state = old_user_state || state.user_state
+
     sync_result =
       case metadata do
-        nil -> sync_to_storage(state)
-        %{} = metadata -> sync_to_storage(state, meta: metadata)
+        nil -> sync_to_storage(state, old_user_state: old_user_state)
+        %{} = metadata -> sync_to_storage(state, meta: metadata, old_user_state: old_user_state)
       end
 
     case sync_result do
@@ -2637,10 +2692,12 @@ defmodule DurableServer do
     %{state | user_state: new_user_state}
   end
 
-  defp auto_sync_to_storage(%DurableServer{module: module, key: key} = state) do
+  defp auto_sync_to_storage(%DurableServer{module: module, key: key} = state, old_user_state) do
     if state.auto_sync do
+      old_user_state = old_user_state || state.user_state
+
       # if auto sync fails we continue, but log
-      case sync_to_storage(state) do
+      case sync_to_storage(state, old_user_state: old_user_state) do
         {:ok, %DurableServer{} = new_state} ->
           new_state
 
@@ -2657,7 +2714,9 @@ defmodule DurableServer do
   end
 
   defp sync_to_storage(%DurableServer{} = state, opts \\ []) do
-    opts = Keyword.validate!(opts, [:meta])
+    opts = Keyword.validate!(opts, [:meta, :old_user_state])
+    old_user_state = Keyword.get(opts, :old_user_state, state.user_state)
+
     # if meta overrides are provided, we always force sync
     {meta_overrides, force} =
       case Keyword.fetch(opts, :meta) do
@@ -2695,13 +2754,25 @@ defmodule DurableServer do
 
       case put_object(new_state, storage_key(new_state), data) do
         {:ok, %DurableServer{} = new_state} ->
-          {:ok, %{new_state | status: meta_overrides[:status] || new_state.status}}
+          synced_state = %{new_state | status: meta_overrides[:status] || new_state.status}
+          {:ok, apply_handle_sync!(synced_state, old_user_state)}
 
         {:error, reason} ->
           {:error, reason}
       end
     else
       {:ok, new_state}
+    end
+  end
+
+  defp apply_handle_sync!(%DurableServer{} = state, old_user_state) do
+    case state.module.handle_sync(old_user_state, state.user_state) do
+      {:ok, new_user_state} ->
+        update_state(state, new_user_state)
+
+      other ->
+        raise ArgumentError,
+              "expected handle_sync/2 to return {:ok, state}, got: #{inspect(other)}"
     end
   end
 
