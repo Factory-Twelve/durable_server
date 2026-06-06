@@ -677,22 +677,34 @@ defmodule DurableServer do
             when new_state: term()
 
   @doc """
-  Optional callback invoked inline after DurableServer successfully writes state
-  to the configured storage backend.
+  Optional callback invoked inline after DurableServer successfully writes user
+  state to the configured storage backend.
 
-  `handle_sync/2` only runs after an actual backend write. It is not called when
-  a sync request noops because the dumped user state is unchanged and no metadata
-  override forced a write.
+  `handle_sync/3` only runs after an actual backend write that includes changed
+  dumped user state. It is not called when a sync request noops because the
+  dumped user state is unchanged, and it is not called for metadata-only writes
+  such as final status persistence during termination.
 
-  The callback receives the user state before the callback that triggered the
-  sync and the user state that was just persisted. The returned state updates
-  the in-memory process state only; it is not included in the already-completed
-  storage write. If you return changes that affect `dump_state/1`, they will be
-  eligible for a later sync.
+  For normal callback-triggered syncs, the callback receives the user state
+  before the callback that triggered the sync and the user state that was just
+  persisted. Lifecycle syncs may pass the same value for both state arguments.
+  The returned state updates the in-memory process state only; it is not
+  included in the already-completed storage write. If you return changes that
+  affect `dump_state/1`, they will be eligible for a later sync.
+
+  The info map contains:
+
+    * `:key` - DurableServer key
+    * `:supervisor` - Supervisor name
+    * `:status` - The persisted `DurableServer.Meta.status` for this write
 
   ## Examples
 
-      def handle_sync(old_state, new_state) do
+      def handle_sync(%{status: :deleting}, _old_state, new_state) do
+        {:ok, new_state}
+      end
+
+      def handle_sync(%{status: :running}, old_state, new_state) do
         if old_state.count != new_state.count do
           Logger.info("persisted count=\#{new_state.count}")
         end
@@ -700,7 +712,7 @@ defmodule DurableServer do
         {:ok, new_state}
       end
   """
-  @callback handle_sync(old_state :: map(), new_state :: map()) :: {:ok, map()}
+  @callback handle_sync(info :: map(), old_state :: map(), new_state :: map()) :: {:ok, map()}
 
   @callback terminate(reason :: term(), state :: term()) :: term()
 
@@ -806,7 +818,7 @@ defmodule DurableServer do
                       handle_cast: 2,
                       handle_info: 2,
                       handle_continue: 2,
-                      handle_sync: 2,
+                      handle_sync: 3,
                       terminate: 2,
                       after_terminate: 2,
                       code_change: 3
@@ -912,7 +924,7 @@ defmodule DurableServer do
         {:noreply, state}
       end
 
-      def handle_sync(_old_state, new_state) do
+      def handle_sync(_info, _old_state, new_state) do
         {:ok, new_state}
       end
 
@@ -945,7 +957,7 @@ defmodule DurableServer do
                      handle_cast: 2,
                      handle_info: 2,
                      handle_continue: 2,
-                     handle_sync: 2,
+                     handle_sync: 3,
                      terminate: 2,
                      after_terminate: 2,
                      code_change: 3
@@ -2734,8 +2746,9 @@ defmodule DurableServer do
 
     old_last_synced_user_state_hash = state.last_synced_user_state_hash
     {%DurableServer{} = new_state, dumped_user_state} = dump_user_state(state)
+    user_state_changed? = new_state.last_synced_user_state_hash != old_last_synced_user_state_hash
 
-    if force || new_state.last_synced_user_state_hash != old_last_synced_user_state_hash do
+    if force || user_state_changed? do
       new_state = %{new_state | last_heartbeat_at: System.system_time(:millisecond)}
       %Meta{} = base_meta = dump_meta(new_state)
 
@@ -2754,8 +2767,8 @@ defmodule DurableServer do
 
       case put_object(new_state, storage_key(new_state), data) do
         {:ok, %DurableServer{} = new_state} ->
-          synced_state = %{new_state | status: meta_overrides[:status] || new_state.status}
-          {:ok, apply_handle_sync!(synced_state, old_user_state)}
+          synced_state = %{new_state | status: new_meta.status}
+          maybe_apply_handle_sync(synced_state, old_user_state, user_state_changed?)
 
         {:error, reason} ->
           {:error, reason}
@@ -2765,14 +2778,24 @@ defmodule DurableServer do
     end
   end
 
+  defp maybe_apply_handle_sync(%DurableServer{} = state, old_user_state, true) do
+    {:ok, apply_handle_sync!(state, old_user_state)}
+  end
+
+  defp maybe_apply_handle_sync(%DurableServer{} = state, _old_user_state, false) do
+    {:ok, state}
+  end
+
   defp apply_handle_sync!(%DurableServer{} = state, old_user_state) do
-    case state.module.handle_sync(old_user_state, state.user_state) do
+    info = %{key: state.key, supervisor: state.supervisor, status: state.status}
+
+    case state.module.handle_sync(info, old_user_state, state.user_state) do
       {:ok, new_user_state} ->
         update_state(state, new_user_state)
 
       other ->
         raise ArgumentError,
-              "expected handle_sync/2 to return {:ok, state}, got: #{inspect(other)}"
+              "expected handle_sync/3 to return {:ok, state}, got: #{inspect(other)}"
     end
   end
 

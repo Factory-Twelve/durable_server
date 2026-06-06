@@ -601,9 +601,9 @@ defmodule DurableServerTest do
        }, auto_sync: Map.get(init_state, :auto_sync?, false)}
     end
 
-    def handle_sync(old_state, new_state) do
+    def handle_sync(info, old_state, new_state) do
       if is_pid(new_state.test_pid) do
-        send(new_state.test_pid, {:handle_sync, old_state, new_state})
+        send(new_state.test_pid, {:handle_sync, info, old_state, new_state})
         {:ok, %{new_state | sync_count: new_state.sync_count + 1}}
       else
         {:ok, new_state}
@@ -626,6 +626,19 @@ defmodule DurableServerTest do
     def handle_call(:increment_auto, _from, %{count: count} = state) do
       new_state = %{state | count: count + 1}
       {:reply, count + 1, new_state}
+    end
+
+    def handle_call(:increment_no_sync, _from, %{count: count} = state) do
+      new_state = %{state | count: count + 1}
+      {:reply, count + 1, new_state}
+    end
+
+    def handle_call(:stop_without_user_state_change, _from, state) do
+      {:stop, :normal, :ok, state}
+    end
+
+    def handle_call(:stop_with_user_state_change, _from, %{count: count} = state) do
+      {:stop, :normal, :ok, %{state | count: count + 1}}
     end
 
     def handle_call(:get_state, _from, state) do
@@ -1658,10 +1671,13 @@ defmodule DurableServerTest do
       assert :ok = GenServer.call(pid, {:set_test_pid, self()})
 
       assert :ok = GenServer.call(pid, :sync_same)
-      refute_receive {:handle_sync, _old_state, _new_state}, 100
+      refute_receive {:handle_sync, _info, _old_state, _new_state}, 100
 
       assert 1 = GenServer.call(pid, :increment_sync)
-      assert_receive {:handle_sync, old_state, new_state}, 1_000
+      assert_receive {:handle_sync, info, old_state, new_state}, 1_000
+      assert info.status == :running
+      assert info.key == key
+      assert info.supervisor == supervisor_name
       assert old_state.count == 0
       assert new_state.count == 1
       assert new_state.sync_count == 0
@@ -1669,7 +1685,7 @@ defmodule DurableServerTest do
       assert %{count: 1, sync_count: 1} = GenServer.call(pid, :get_state)
 
       assert :ok = GenServer.call(pid, :sync_same)
-      refute_receive {:handle_sync, _old_state, _new_state}, 100
+      refute_receive {:handle_sync, _info, _old_state, _new_state}, 100
 
       store = test_object_store()
       {:ok, persisted_data} = DurableServer.fetch_stored_state(store, %{key: key, prefix: prefix})
@@ -1692,15 +1708,82 @@ defmodule DurableServerTest do
         )
 
       assert :ok = GenServer.call(pid, {:set_test_pid, self()})
-      refute_receive {:handle_sync, _old_state, _new_state}, 100
+      refute_receive {:handle_sync, _info, _old_state, _new_state}, 100
 
       assert 1 = GenServer.call(pid, :increment_auto)
-      assert_receive {:handle_sync, old_state, new_state}, 1_000
+      assert_receive {:handle_sync, info, old_state, new_state}, 1_000
+      assert info.status == :running
+      assert info.key == key
+      assert info.supervisor == supervisor_name
       assert old_state.count == 0
       assert new_state.count == 1
       assert new_state.sync_count == 0
 
       assert %{count: 1, sync_count: 1} = GenServer.call(pid, :get_state)
+    end
+
+    test "does not run for terminate final status persistence when user state is unchanged", %{
+      supervisor_name: supervisor_name
+    } do
+      key = "handle-sync-terminate-status-only-#{DurableServer.UUID.uuid4()}"
+
+      {:ok, {pid, _meta}} =
+        DurableServer.Supervisor.start_child(
+          supervisor_name,
+          {HandleSyncTestServer, key: key, initial_state: %{count: 0}}
+        )
+
+      ref = Process.monitor(pid)
+      assert :ok = GenServer.call(pid, {:set_test_pid, self()})
+      assert :ok = GenServer.call(pid, :stop_without_user_state_change)
+      assert_receive {:DOWN, ^ref, :process, ^pid, :normal}, 1_000
+      refute_receive {:handle_sync, _info, _old_state, _new_state}, 100
+    end
+
+    test "runs for terminate final persistence when user state changed", %{
+      supervisor_name: supervisor_name
+    } do
+      key = "handle-sync-terminate-state-changed-#{DurableServer.UUID.uuid4()}"
+
+      {:ok, {pid, _meta}} =
+        DurableServer.Supervisor.start_child(
+          supervisor_name,
+          {HandleSyncTestServer, key: key, initial_state: %{count: 0}}
+        )
+
+      ref = Process.monitor(pid)
+      assert :ok = GenServer.call(pid, {:set_test_pid, self()})
+      assert :ok = GenServer.call(pid, :stop_with_user_state_change)
+      assert_receive {:handle_sync, info, old_state, new_state}, 1_000
+      assert info.status == :stopped_graceful
+      assert info.key == key
+      assert info.supervisor == supervisor_name
+      assert old_state.count == 1
+      assert new_state.count == 1
+      assert_receive {:DOWN, ^ref, :process, ^pid, :normal}, 1_000
+    end
+
+    test "marks terminate_and_delete_child final persistence as deleting", %{
+      supervisor_name: supervisor_name
+    } do
+      key = "handle-sync-delete-state-changed-#{DurableServer.UUID.uuid4()}"
+
+      {:ok, {pid, _meta}} =
+        DurableServer.Supervisor.start_child(
+          supervisor_name,
+          {HandleSyncTestServer, key: key, initial_state: %{count: 0}}
+        )
+
+      assert :ok = GenServer.call(pid, {:set_test_pid, self()})
+      assert 1 = GenServer.call(pid, :increment_no_sync)
+      assert :ok = DurableServer.Supervisor.terminate_and_delete_child(supervisor_name, pid)
+
+      assert_receive {:handle_sync, info, old_state, new_state}, 1_000
+      assert info.status == :deleting
+      assert info.key == key
+      assert info.supervisor == supervisor_name
+      assert old_state.count == 1
+      assert new_state.count == 1
     end
   end
 
