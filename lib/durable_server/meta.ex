@@ -145,6 +145,8 @@ defmodule DurableServer.Meta do
 
   def stopped_graceful?(%Meta{} = meta), do: meta.status == @stopped_graceful
 
+  def deleting?(%Meta{} = meta), do: meta.status == @deleting
+
   def permanently_crashed?(%Meta{} = meta), do: meta.status == @permanently_crashed
 
   def put_status(%Meta{} = meta, status) when status in @statuses do

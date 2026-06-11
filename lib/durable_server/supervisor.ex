@@ -88,6 +88,11 @@ defmodule DurableServer.Supervisor do
   - `:heartbeat_interval_ms` - How often to write node heartbeats (default: 10_000)
   - `:heartbeat_staleness_threshold_ms` - How long a node heartbeat may go without success
     before the node is considered stale/orphan-claimable (default: 30_000)
+  - `:delete_tombstone_delete_request_margin_ms` - Safety margin added to
+    `:heartbeat_staleness_threshold_ms` before an abandoned delete tombstone may be
+    replaced by an explicit start. Existing delete tombstones are only reused for
+    physical delete while they are outside this margin. Configure this at least as
+    high as the storage backend's maximum delete request duration (default: 30_000)
   - `:heartbeat_tracking_mode` - Heartbeat cache strategy: `:poll` or `:subscribe`.
     Defaults from backend capabilities.
   - `:heartbeat_reconcile_interval_ms` - Full heartbeat cache reconcile interval used
@@ -229,6 +234,7 @@ defmodule DurableServer.Supervisor do
   @default_parallel_restart_batch_size 50
   @default_restart_start_timeout_ms 30_000
   @default_heartbeat_staleness_threshold_ms 30_000
+  @default_delete_tombstone_delete_request_margin_ms 30_000
   @default_restart_claim_preferred_fanout 2
   @default_restart_claim_expanded_fanout 4
   @default_restart_claim_gate_expand_after_ms :timer.seconds(30)
@@ -644,6 +650,8 @@ defmodule DurableServer.Supervisor do
   - `:heartbeat_interval_ms` - Node heartbeat interval (default: 10_000)
   - `:heartbeat_staleness_threshold_ms` - Node heartbeat stale/orphan threshold
     (default: 30_000)
+  - `:delete_tombstone_delete_request_margin_ms` - Delete tombstone physical-delete
+    request safety margin (default: 30_000)
   - `:heartbeat_tracking_mode` - Heartbeat cache strategy: `:poll` or `:subscribe`
   - `:heartbeat_reconcile_interval_ms` - Full heartbeat cache reconcile interval
   - `:dead_node_threshold_ms` - Dead node cleanup threshold (default: 300_000)
@@ -3110,6 +3118,7 @@ defmodule DurableServer.Supervisor do
         :restart_claim_gate_disable_after_ms,
         :heartbeat_interval_ms,
         :heartbeat_staleness_threshold_ms,
+        :delete_tombstone_delete_request_margin_ms,
         :heartbeat_tracking_mode,
         :heartbeat_reconcile_interval_ms,
         :graceful_shutdown_timeout_ms,
@@ -3240,6 +3249,13 @@ defmodule DurableServer.Supervisor do
         @default_heartbeat_staleness_threshold_ms
       )
 
+    delete_tombstone_delete_request_margin_ms =
+      extract_positive_integer!(
+        opts,
+        :delete_tombstone_delete_request_margin_ms,
+        @default_delete_tombstone_delete_request_margin_ms
+      )
+
     max_heartbeat_interval = div(heartbeat_staleness_threshold_ms, 2)
 
     if heartbeat_interval_ms > max_heartbeat_interval do
@@ -3349,6 +3365,7 @@ defmodule DurableServer.Supervisor do
       restart_claim_gate_disable_after_ms: restart_claim_gate_disable_after_ms,
       heartbeat_interval_ms: heartbeat_interval_ms,
       heartbeat_staleness_threshold_ms: heartbeat_staleness_threshold_ms,
+      delete_tombstone_delete_request_margin_ms: delete_tombstone_delete_request_margin_ms,
       heartbeat_tracking_mode: heartbeat_tracking_mode,
       heartbeat_reconcile_interval_ms: heartbeat_reconcile_interval_ms,
       graceful_shutdown_timeout_ms: Keyword.get(opts, :graceful_shutdown_timeout_ms, 30_000),

@@ -2121,6 +2121,11 @@ defmodule DurableServer.LifecycleManager do
         case fetch_restartable_stored_state(state, key, etag, entry) do
           {:ok, %StoredState{meta: %Meta{} = meta} = obj} ->
             cond do
+              # delete intent suppresses automatic recovery; explicit starts may
+              # CAS-replace an abandoned delete tombstone.
+              Meta.deleting?(meta) ->
+                :skip
+
               # never restart permanently crashed servers
               Meta.permanently_crashed?(meta) ->
                 :skip

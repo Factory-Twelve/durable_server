@@ -689,8 +689,15 @@ defmodule DurableServer do
   before the callback that triggered the sync and the user state that was just
   persisted. Lifecycle syncs may pass the same value for both state arguments.
   The returned state updates the in-memory process state only; it is not
-  included in the already-completed storage write. If you return changes that
-  affect `dump_state/1`, they will be eligible for a later sync.
+  included in the already-completed storage write, and DurableServer does not
+  recursively sync or call `handle_sync/3` again for changes returned from this
+  callback.
+
+  This makes `handle_sync/3` appropriate for side effects and transient runtime
+  bookkeeping, such as updating non-dumped fields, refs, counters, or cached
+  notification state. If you return changes that affect `dump_state/1`, those
+  changes remain in memory and are only eligible for a later explicit,
+  automatic, or lifecycle sync.
 
   The info map contains:
 
@@ -1181,7 +1188,8 @@ defmodule DurableServer do
               map_size(boot_info) == 3 and map_size(preloaded) == 2,
        do: preloaded
 
-  defp load_fresh_init_state(module, init_arg, object_store) do
+  defp load_fresh_init_state(module, init_arg, object_store, opts \\ []) do
+    opts = Keyword.validate!(opts, [:etag])
     initial_state = Keyword.fetch!(init_arg, :initial_state)
 
     with dumped_init_state <-
@@ -1193,7 +1201,7 @@ defmodule DurableServer do
          {:ok, client_init_state} <-
            StorageBackend.decode(object_store, encoded_init_state) do
       loaded_user_state = load_user_state(module, _old_vsn = nil, client_init_state)
-      {:ok, {loaded_user_state, _old_vsn = nil, _etag = nil, _meta = nil}}
+      {:ok, {loaded_user_state, _old_vsn = nil, Keyword.get(opts, :etag), _meta = nil}}
     end
   end
 
@@ -1285,7 +1293,10 @@ defmodule DurableServer do
     end
   end
 
-  defp acquire_delete_lock(%StorageBackend{} = store, %{key: key, prefix: prefix}) do
+  defp acquire_delete_lock(
+         %StorageBackend{} = store,
+         %{key: key, prefix: prefix, supervisor: supervisor_name}
+       ) do
     storage_key = prefix <> key
 
     Logger.info("delete: trying to aquire delete lock for #{storage_key}")
@@ -1297,7 +1308,8 @@ defmodule DurableServer do
         status: :deleting,
         pid: nil,
         node_str: Atom.to_string(Node.self()),
-        node_ref: nil,
+        node_ref: node_ref_for_delete_tombstone(supervisor_name),
+        supervisor: supervisor_name,
         last_heartbeat_at: System.system_time(:millisecond),
         crash_history: []
       }
@@ -1312,58 +1324,88 @@ defmodule DurableServer do
         {:error, reason}
 
       # object still exists and we have its etag for writing our lock
-      {:ok, %{etag: current_etag}} ->
+      {:ok, %{body: %StoredState{meta: %Meta{} = meta}, etag: current_etag}} ->
         Logger.info("delete: #{storage_key} exists, attempting to claim orphaned lock")
 
-        result =
-          StorageBackend.update_object(
-            store,
-            storage_key,
-            fn
-              # someone raced us on the lock (different etag)
-              # we don't need to check the lock because we know they just grabbed it
-              # so their node is healhty
-              %{body: %StoredState{meta: %Meta{} = meta}, etag: etag} when etag != current_etag ->
-                meta = %{meta | key: key, prefix: prefix}
-                {:error, {:locked, meta.pid}}
+        meta = %{meta | key: key, prefix: prefix}
 
-              %{body: %StoredState{}, etag: etag} when etag != current_etag ->
-                {:error, {:locked, nil}}
+        cond do
+          Meta.deleting?(meta) and delete_tombstone_delete_window_open?(meta) ->
+            :ok
 
-              %{body: %StoredState{} = stored_state, etag: ^current_etag} ->
-                stored_state =
-                  attach_stored_state_context(stored_state, %{key: key, prefix: prefix})
+          Meta.deleting?(meta) and delete_tombstone_active?(meta) ->
+            {:error, {:locked, :deleting}}
 
-                case check_lock(stored_state.meta) do
-                  :expired ->
-                    Logger.info("delete: #{storage_key} found to be expired, claimed expired key")
+          true ->
+            result =
+              StorageBackend.update_object(
+                store,
+                storage_key,
+                fn
+                  # someone raced us on the lock. If they wrote a delete tombstone,
+                  # use that tombstone etag; otherwise treat their fresh lock as live.
+                  %{body: %StoredState{meta: %Meta{} = meta}, etag: etag}
+                  when etag != current_etag ->
+                    meta = %{meta | key: key, prefix: prefix}
 
-                    {:ok, deleting_data}
+                    if Meta.deleting?(meta) do
+                      {:error, {:deleting, etag}}
+                    else
+                      {:error, {:locked, meta.pid}}
+                    end
 
-                  {:locked, lock_pid} ->
-                    Logger.info(
-                      "delete: cannot claim lock for delete on #{storage_key} - locked by #{inspect(lock_pid)}"
-                    )
+                  %{body: %StoredState{}, etag: etag} when etag != current_etag ->
+                    {:error, {:locked, nil}}
 
-                    {:error, {:locked, lock_pid}}
-                end
+                  %{body: %StoredState{} = stored_state, etag: ^current_etag} ->
+                    stored_state =
+                      attach_stored_state_context(stored_state, %{key: key, prefix: prefix})
 
-              %{body: other, etag: _etag} ->
-                {:error, {:unexpected_value_type, other}}
-            end,
-            timeout: :infinity,
-            max_retries: 0
-          )
+                    case check_lock(stored_state.meta) do
+                      :expired ->
+                        Logger.info(
+                          "delete: #{storage_key} found to be expired, claimed expired key"
+                        )
 
-        case result do
-          {:ok, %{etag: _}} -> :ok
-          # object no longer exists, so we proceed as normal
-          {:error, :not_found} -> :ok
-          {:error, {:locked, lock_pid}} -> {:error, {:locked, lock_pid}}
-          {:error, reason} -> {:error, reason}
+                        {:ok, deleting_data}
+
+                      {:locked, lock_pid} ->
+                        Logger.info(
+                          "delete: cannot claim lock for delete on #{storage_key} - locked by #{inspect(lock_pid)}"
+                        )
+
+                        {:error, {:locked, lock_pid}}
+                    end
+
+                  %{body: other, etag: _etag} ->
+                    {:error, {:unexpected_value_type, other}}
+                end,
+                timeout: :infinity,
+                max_retries: 0
+              )
+
+            case result do
+              {:ok, %{etag: _tombstone_etag}} -> :ok
+              {:error, {:deleting, _tombstone_etag}} -> :ok
+              # object no longer exists, so we proceed as normal
+              {:error, :not_found} -> :ok
+              {:error, {:locked, lock_pid}} -> {:error, {:locked, lock_pid}}
+              {:error, reason} -> {:error, reason}
+            end
         end
+
+      {:ok, %{body: other}} ->
+        {:error, {:unexpected_value_type, other}}
     end
   end
+
+  defp node_ref_for_delete_tombstone(supervisor_name) when is_atom(supervisor_name) do
+    DurableServer.Supervisor.node_ref(supervisor_name)
+  rescue
+    _ -> nil
+  end
+
+  defp node_ref_for_delete_tombstone(_supervisor_name), do: nil
 
   defp register_pid(%DurableServer{} = state) do
     case DurableServer.Supervisor.__register_child__(
@@ -1434,7 +1476,11 @@ defmodule DurableServer do
     %{prefix: prefix, storage_backend: store} = config
     storage_key = prefix <> key
 
-    case acquire_delete_lock(store, %{key: key, prefix: prefix}) do
+    case acquire_delete_lock(store, %{
+           key: key,
+           prefix: prefix,
+           supervisor: Map.get(config, :name)
+         }) do
       # TODO have lifecycle manager handle cleaning up delete locks that failed at this point
       :ok ->
         # successfully acquired lock and marked as :deleting, now delete the object
@@ -1461,12 +1507,11 @@ defmodule DurableServer do
           "Object #{storage_key} is locked, sending delete message to process #{inspect(pid)}"
         )
 
-        delete_by_pid(pid, timeout)
-
-      {:error, :not_found} ->
-        # object doesn't exist, consider this success
-        Logger.info("Object #{storage_key} already deleted")
-        :ok
+        if is_pid(pid) do
+          delete_by_pid(pid, timeout)
+        else
+          {:error, {:locked, pid}}
+        end
 
       {:error, reason} ->
         Logger.error("Failed to acquire delete lock for #{storage_key}: #{inspect(reason)}")
@@ -1836,29 +1881,33 @@ defmodule DurableServer do
                     {:error, {:already_started, lock_pid}}
 
                   :expired ->
-                    if preloaded_boot do
-                      loaded_state = load_user_state(module, existing.vsn, existing.state)
-                      {:ok, {loaded_state, existing.vsn, existing.etag, meta}}
+                    if Meta.deleting?(meta) do
+                      load_fresh_init_state(module, init_arg, object_store, etag: existing.etag)
                     else
-                      case reread_expired_state(object_store, %{key: key, prefix: prefix}) do
-                        {:ok,
-                         %StoredState{
-                           meta: %Meta{} = current_meta,
-                           vsn: current_vsn,
-                           state: current_raw_state,
-                           etag: current_etag
-                         }} ->
-                          loaded_state = load_user_state(module, current_vsn, current_raw_state)
-                          {:ok, {loaded_state, current_vsn, current_etag, current_meta}}
+                      if preloaded_boot do
+                        loaded_state = load_user_state(module, existing.vsn, existing.state)
+                        {:ok, {loaded_state, existing.vsn, existing.etag, meta}}
+                      else
+                        case reread_expired_state(object_store, %{key: key, prefix: prefix}) do
+                          {:ok,
+                           %StoredState{
+                             meta: %Meta{} = current_meta,
+                             vsn: current_vsn,
+                             state: current_raw_state,
+                             etag: current_etag
+                           }} ->
+                            loaded_state = load_user_state(module, current_vsn, current_raw_state)
+                            {:ok, {loaded_state, current_vsn, current_etag, current_meta}}
 
-                        {:error, {:already_started, lock_pid}} ->
-                          {:error, {:already_started, lock_pid}}
+                          {:error, {:already_started, lock_pid}} ->
+                            {:error, {:already_started, lock_pid}}
 
-                        :error ->
-                          load_fresh_init_state(module, init_arg, object_store)
+                          :error ->
+                            load_fresh_init_state(module, init_arg, object_store)
 
-                        {:error, reason} ->
-                          {:error, reason}
+                          {:error, reason} ->
+                            {:error, reason}
+                        end
                       end
                     end
                 end
@@ -2949,6 +2998,11 @@ defmodule DurableServer do
     report_lock_diagnostic(sup_name, :check_lock_calls)
 
     cond do
+      # delete tombstones are not live process locks and may not have owner fields
+      Meta.deleting?(meta) ->
+        report_lock_diagnostic(sup_name, :check_lock_deleting)
+        delete_tombstone_lock_status(meta)
+
       # if the pid lock holder wrote the graceful stop, it's gone
       Meta.stopped_graceful?(meta) ->
         report_lock_diagnostic(sup_name, :check_lock_stopped_graceful)
@@ -3043,6 +3097,68 @@ defmodule DurableServer do
         check_lock_via_storage_heartbeat(meta)
     end
   end
+
+  defp delete_tombstone_lock_status(%Meta{} = meta) do
+    case delete_tombstone_age_and_timing(meta) do
+      {:ok, age_ms, staleness_ms, _margin_ms} when age_ms > staleness_ms -> :expired
+      {:ok, _age_ms, _staleness_ms, _margin_ms} -> {:locked, :deleting}
+      :unknown -> {:locked, :deleting}
+    end
+  end
+
+  defp delete_tombstone_active?(%Meta{} = meta) do
+    case delete_tombstone_lock_status(meta) do
+      {:locked, :deleting} -> true
+      :expired -> false
+    end
+  end
+
+  defp delete_tombstone_delete_window_open?(%Meta{} = meta) do
+    case delete_tombstone_age_and_timing(meta) do
+      {:ok, age_ms, staleness_ms, margin_ms} ->
+        age_ms <= staleness_ms - margin_ms
+
+      :unknown ->
+        false
+    end
+  end
+
+  defp delete_tombstone_age_and_timing(%Meta{last_heartbeat_at: timestamp} = meta)
+       when is_integer(timestamp) do
+    case delete_tombstone_timing_ms(meta) do
+      {:ok, staleness_ms, margin_ms} ->
+        {:ok, System.system_time(:millisecond) - timestamp, staleness_ms, margin_ms}
+
+      :unknown ->
+        :unknown
+    end
+  end
+
+  defp delete_tombstone_age_and_timing(%Meta{}), do: :unknown
+
+  defp delete_tombstone_timing_ms(%Meta{supervisor: supervisor_name})
+       when is_atom(supervisor_name) do
+    try do
+      case DurableServer.Supervisor.__get_config__(supervisor_name) do
+        %{
+          heartbeat_staleness_threshold_ms: heartbeat_ms,
+          delete_tombstone_delete_request_margin_ms: margin_ms
+        }
+        when is_integer(heartbeat_ms) and heartbeat_ms > 0 and is_integer(margin_ms) and
+               margin_ms > 0 ->
+          {:ok, heartbeat_ms + margin_ms, margin_ms}
+
+        _ ->
+          :unknown
+      end
+    rescue
+      _ -> :unknown
+    catch
+      _, _ -> :unknown
+    end
+  end
+
+  defp delete_tombstone_timing_ms(%Meta{}), do: :unknown
 
   # Fallback when local heartbeat cache returns :unknown - fetch heartbeat directly from storage
   defp check_lock_via_storage_heartbeat(

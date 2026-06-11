@@ -264,6 +264,7 @@ defmodule DurableServer.SupervisorBackendSpecTest do
          parallel_restart_batch_size: 7,
          restart_start_timeout_ms: 12_000,
          heartbeat_staleness_threshold_ms: 30_000,
+         delete_tombstone_delete_request_margin_ms: 9_000,
          restart_claim_preferred_fanout: 3,
          restart_claim_expanded_fanout: 5,
          restart_claim_gate_expand_after_ms: 5_000,
@@ -278,6 +279,7 @@ defmodule DurableServer.SupervisorBackendSpecTest do
       parallel_restart_batch_size: parallel_restart_batch_size,
       restart_start_timeout_ms: restart_start_timeout_ms,
       heartbeat_staleness_threshold_ms: heartbeat_staleness_threshold_ms,
+      delete_tombstone_delete_request_margin_ms: delete_tombstone_delete_request_margin_ms,
       restart_claim_preferred_fanout: restart_claim_preferred_fanout,
       restart_claim_expanded_fanout: restart_claim_expanded_fanout,
       restart_claim_gate_expand_after_ms: restart_claim_gate_expand_after_ms,
@@ -289,6 +291,7 @@ defmodule DurableServer.SupervisorBackendSpecTest do
     assert parallel_restart_batch_size == 7
     assert restart_start_timeout_ms == 12_000
     assert heartbeat_staleness_threshold_ms == 30_000
+    assert delete_tombstone_delete_request_margin_ms == 9_000
     assert restart_claim_preferred_fanout == 3
     assert restart_claim_expanded_fanout == 5
     assert restart_claim_gate_expand_after_ms == 5_000
@@ -301,6 +304,7 @@ defmodule DurableServer.SupervisorBackendSpecTest do
     assert state.parallel_restart_batch_size == 7
     assert state.restart_start_timeout_ms == 12_000
     assert state.config.heartbeat_staleness_threshold_ms == 30_000
+    assert state.config.delete_tombstone_delete_request_margin_ms == 9_000
     assert state.restart_claim_preferred_fanout == 3
     assert state.restart_claim_expanded_fanout == 5
     assert state.restart_claim_gate_expand_after_ms == 5_000
@@ -424,6 +428,18 @@ defmodule DurableServer.SupervisorBackendSpecTest do
            prefix: unique_prefix("invalid_heartbeat_staleness"),
            backend: {InMemoryBackend, name: :invalid_heartbeat_staleness},
            heartbeat_staleness_threshold_ms: 2_000
+         ]}
+      )
+    end
+
+    assert_raise RuntimeError, ~r/delete_tombstone_delete_request_margin_ms/, fn ->
+      start_supervised!(
+        {DurableServer.Supervisor,
+         [
+           name: unique_supervisor_name("invalid_delete_tombstone_margin"),
+           prefix: unique_prefix("invalid_delete_tombstone_margin"),
+           backend: {InMemoryBackend, name: :invalid_delete_tombstone_margin},
+           delete_tombstone_delete_request_margin_ms: 0
          ]}
       )
     end

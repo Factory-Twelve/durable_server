@@ -3602,6 +3602,174 @@ defmodule DurableServerTest do
       %{supervisor_name: supervisor_name, supervisor_pid: supervisor_pid, prefix: prefix}
     end
 
+    test "explicit start waits while delete tombstone is inside its lease" do
+      {supervisor_name, _supervisor_pid, prefix} =
+        start_test_supervisor(backend: {ConsistencyProbeBackend, owner: self()})
+
+      %{storage_backend: store} = DurableServer.Supervisor.__get_config__(supervisor_name)
+      key = "delete_tombstone_active_#{DurableServer.UUID.uuid4()}"
+      storage_key = prefix <> key
+
+      deleting_tombstone = %StoredState{
+        vsn: 1,
+        state: %{},
+        meta: %Meta{
+          status: :deleting,
+          pid: nil,
+          supervisor: supervisor_name,
+          module: nil,
+          node_ref: nil,
+          node_str: to_string(Node.self()),
+          last_heartbeat_at: System.system_time(:millisecond),
+          crash_history: []
+        }
+      }
+
+      {:ok, %{etag: tombstone_etag}} =
+        StorageBackend.put_object(store, storage_key, deleting_tombstone, [])
+
+      assert {:error, {:already_started, :deleting}} =
+               DurableServer.Supervisor.start_child(
+                 supervisor_name,
+                 {TestServer, key: key, initial_state: %{count: 41}}
+               )
+
+      {:ok, stored_state} =
+        DurableServer.fetch_stored_state(store, %{key: key, prefix: prefix}, consistent: true)
+
+      assert stored_state.etag == tombstone_etag
+      assert stored_state.meta.status == :deleting
+    end
+
+    test "explicit delete waits while delete tombstone is inside delete request margin" do
+      {supervisor_name, _supervisor_pid, prefix} =
+        start_test_supervisor(
+          backend: {ConsistencyProbeBackend, owner: self()},
+          delete_tombstone_delete_request_margin_ms: 5_000
+        )
+
+      %{
+        storage_backend: store,
+        heartbeat_staleness_threshold_ms: heartbeat_staleness_threshold_ms,
+        delete_tombstone_delete_request_margin_ms: delete_tombstone_delete_request_margin_ms
+      } = DurableServer.Supervisor.__get_config__(supervisor_name)
+
+      key = "delete_tombstone_margin_#{DurableServer.UUID.uuid4()}"
+      storage_key = prefix <> key
+
+      deleting_tombstone = %StoredState{
+        vsn: 1,
+        state: %{},
+        meta: %Meta{
+          status: :deleting,
+          pid: nil,
+          supervisor: supervisor_name,
+          module: nil,
+          node_ref: nil,
+          node_str: to_string(Node.self()),
+          last_heartbeat_at:
+            System.system_time(:millisecond) - heartbeat_staleness_threshold_ms -
+              div(delete_tombstone_delete_request_margin_ms, 2),
+          crash_history: []
+        }
+      }
+
+      {:ok, %{etag: tombstone_etag}} =
+        StorageBackend.put_object(store, storage_key, deleting_tombstone, [])
+
+      assert {:error, {:locked, :deleting}} =
+               DurableServer.Supervisor.terminate_and_delete_child(supervisor_name, key)
+
+      {:ok, stored_state} =
+        DurableServer.fetch_stored_state(store, %{key: key, prefix: prefix}, consistent: true)
+
+      assert stored_state.etag == tombstone_etag
+      assert stored_state.meta.status == :deleting
+    end
+
+    test "explicit start replaces expired delete tombstone with initial state" do
+      {supervisor_name, _supervisor_pid, prefix} =
+        start_test_supervisor(backend: {ConsistencyProbeBackend, owner: self()})
+
+      %{storage_backend: store} = DurableServer.Supervisor.__get_config__(supervisor_name)
+      key = "delete_tombstone_expired_#{DurableServer.UUID.uuid4()}"
+      storage_key = prefix <> key
+
+      deleting_tombstone = %StoredState{
+        vsn: 1,
+        state: %{},
+        meta: %Meta{
+          status: :deleting,
+          pid: nil,
+          supervisor: supervisor_name,
+          module: nil,
+          node_ref: nil,
+          node_str: to_string(Node.self()),
+          last_heartbeat_at: System.system_time(:millisecond) - 120_000,
+          crash_history: []
+        }
+      }
+
+      {:ok, _object} = StorageBackend.put_object(store, storage_key, deleting_tombstone, [])
+
+      {:ok, {pid, _meta}} =
+        DurableServer.Supervisor.start_child(
+          supervisor_name,
+          {TestServer, key: key, initial_state: %{count: 41}}
+        )
+
+      assert 41 = GenServer.call(pid, :get_count)
+
+      refute_process_down(pid)
+
+      {:ok, stored_state} =
+        DurableServer.fetch_stored_state(store, %{key: key, prefix: prefix}, consistent: true)
+
+      assert stored_state.meta.status == :running
+      assert stored_state.meta.pid == pid
+      assert atomify_keys(stored_state.state).count == 41
+    end
+
+    test "explicit start does not guess lease for delete tombstone without supervisor config" do
+      {supervisor_name, _supervisor_pid, prefix} =
+        start_test_supervisor(backend: {ConsistencyProbeBackend, owner: self()})
+
+      %{storage_backend: store} = DurableServer.Supervisor.__get_config__(supervisor_name)
+      key = "delete_tombstone_unknown_#{DurableServer.UUID.uuid4()}"
+      storage_key = prefix <> key
+
+      deleting_tombstone = %StoredState{
+        vsn: 1,
+        state: %{},
+        meta: %Meta{
+          status: :deleting,
+          pid: nil,
+          supervisor: nil,
+          module: nil,
+          node_ref: nil,
+          node_str: to_string(Node.self()),
+          last_heartbeat_at: System.system_time(:millisecond) - 120_000,
+          crash_history: []
+        }
+      }
+
+      {:ok, %{etag: tombstone_etag}} =
+        StorageBackend.put_object(store, storage_key, deleting_tombstone, [])
+
+      assert {:error, {:already_started, :deleting}} =
+               DurableServer.Supervisor.start_child(
+                 supervisor_name,
+                 {TestServer, key: key, initial_state: %{count: 41}}
+               )
+
+      {:ok, stored_state} =
+        DurableServer.fetch_stored_state(store, %{key: key, prefix: prefix}, consistent: true)
+
+      assert stored_state.etag == tombstone_etag
+      assert stored_state.meta.status == :deleting
+      assert stored_state.meta.supervisor == nil
+    end
+
     test "terminate_and_delete_child/2 with PID deletes running process and storage", %{
       supervisor_name: supervisor_name,
       prefix: prefix
