@@ -1132,12 +1132,12 @@ defmodule DurableServer do
   # fetch existing raw object + metadata, or reuse preloaded boot data.
   defp fetch_existing_state_raw(
          %StorageBackend{} = store,
-         %{key: key, prefix: prefix},
+         %{key: key, prefix: prefix, supervisor: _supervisor_name} = request,
          boot_info,
          opts
        ) do
     if Keyword.get(opts, :consistent, false) do
-      case fetch_stored_state(store, %{key: key, prefix: prefix}, opts) do
+      case fetch_stored_state(store, request, opts) do
         {:ok, %StoredState{} = existing_raw_data} -> {:ok, existing_raw_data}
         {:error, _reason} -> :error
       end
@@ -1147,11 +1147,12 @@ defmodule DurableServer do
           {:ok,
            attach_stored_state_context(%{stored_state | etag: etag}, %{
              key: key,
-             prefix: prefix
+             prefix: prefix,
+             supervisor: request.supervisor
            })}
 
         _ ->
-          case fetch_stored_state(store, %{key: key, prefix: prefix}, opts) do
+          case fetch_stored_state(store, request, opts) do
             {:ok, %StoredState{} = existing_raw_data} -> {:ok, existing_raw_data}
             {:error, _reason} -> :error
           end
@@ -1208,7 +1209,7 @@ defmodule DurableServer do
   defp reread_expired_state(%StorageBackend{} = store, %{key: _key, prefix: _prefix} = request) do
     case fetch_stored_state(store, request, consistent: true) do
       {:ok, %StoredState{meta: %Meta{} = meta} = stored_state} ->
-        case check_lock(meta) do
+        case check_lock(meta, Map.fetch!(request, :supervisor)) do
           :expired -> {:ok, stored_state}
           {:locked, lock_pid} -> {:error, {:already_started, lock_pid}}
         end
@@ -1308,8 +1309,7 @@ defmodule DurableServer do
         status: :deleting,
         pid: nil,
         node_str: Atom.to_string(Node.self()),
-        node_ref: node_ref_for_delete_tombstone(supervisor_name),
-        supervisor: supervisor_name,
+        node_ref: nil,
         last_heartbeat_at: System.system_time(:millisecond),
         crash_history: []
       }
@@ -1327,7 +1327,8 @@ defmodule DurableServer do
       {:ok, %{body: %StoredState{meta: %Meta{} = meta}, etag: current_etag}} ->
         Logger.info("delete: #{storage_key} exists, attempting to claim orphaned lock")
 
-        meta = %{meta | key: key, prefix: prefix}
+        meta =
+          meta_with_runtime_context(meta, %{key: key, prefix: prefix, supervisor: supervisor_name})
 
         cond do
           Meta.deleting?(meta) and delete_tombstone_delete_window_open?(meta) ->
@@ -1346,7 +1347,12 @@ defmodule DurableServer do
                   # use that tombstone etag; otherwise treat their fresh lock as live.
                   %{body: %StoredState{meta: %Meta{} = meta}, etag: etag}
                   when etag != current_etag ->
-                    meta = %{meta | key: key, prefix: prefix}
+                    meta =
+                      meta_with_runtime_context(meta, %{
+                        key: key,
+                        prefix: prefix,
+                        supervisor: supervisor_name
+                      })
 
                     if Meta.deleting?(meta) do
                       {:error, {:deleting, etag}}
@@ -1359,9 +1365,13 @@ defmodule DurableServer do
 
                   %{body: %StoredState{} = stored_state, etag: ^current_etag} ->
                     stored_state =
-                      attach_stored_state_context(stored_state, %{key: key, prefix: prefix})
+                      attach_stored_state_context(stored_state, %{
+                        key: key,
+                        prefix: prefix,
+                        supervisor: supervisor_name
+                      })
 
-                    case check_lock(stored_state.meta) do
+                    case check_lock(stored_state.meta, supervisor_name) do
                       :expired ->
                         Logger.info(
                           "delete: #{storage_key} found to be expired, claimed expired key"
@@ -1398,14 +1408,6 @@ defmodule DurableServer do
         {:error, {:unexpected_value_type, other}}
     end
   end
-
-  defp node_ref_for_delete_tombstone(supervisor_name) when is_atom(supervisor_name) do
-    DurableServer.Supervisor.node_ref(supervisor_name)
-  rescue
-    _ -> nil
-  end
-
-  defp node_ref_for_delete_tombstone(_supervisor_name), do: nil
 
   defp register_pid(%DurableServer{} = state) do
     case DurableServer.Supervisor.__register_child__(
@@ -1643,7 +1645,10 @@ defmodule DurableServer do
     case body do
       %StoredState{meta: %Meta{} = meta} = stored_state ->
         stored_state =
-          attach_stored_state_context(%{stored_state | etag: etag}, %{key: key, prefix: prefix})
+          attach_stored_state_context(
+            %{stored_state | etag: etag},
+            %{key: key, prefix: prefix, supervisor: meta.supervisor}
+          )
 
         updated_meta = Meta.clear_restart_attempt(meta)
         updated = %{stored_state | meta: updated_meta}
@@ -1864,7 +1869,7 @@ defmodule DurableServer do
       load_result =
         case fetch_existing_state_raw(
                object_store,
-               %{key: key, prefix: prefix},
+               %{key: key, prefix: prefix, supervisor: supervisor_name},
                boot_info,
                consistent: false
              ) do
@@ -1876,7 +1881,7 @@ defmodule DurableServer do
                 {:error, {:restart_claimed, claimant_node}}
 
               :ok ->
-                case check_lock(meta) do
+                case check_lock(meta, supervisor_name) do
                   {:locked, lock_pid} ->
                     {:error, {:already_started, lock_pid}}
 
@@ -1888,7 +1893,11 @@ defmodule DurableServer do
                         loaded_state = load_user_state(module, existing.vsn, existing.state)
                         {:ok, {loaded_state, existing.vsn, existing.etag, meta}}
                       else
-                        case reread_expired_state(object_store, %{key: key, prefix: prefix}) do
+                        case reread_expired_state(object_store, %{
+                               key: key,
+                               prefix: prefix,
+                               supervisor: supervisor_name
+                             }) do
                           {:ok,
                            %StoredState{
                              meta: %Meta{} = current_meta,
@@ -2860,7 +2869,7 @@ defmodule DurableServer do
 
     {%DurableServer{} = repaired_state, dumped_user_state} = dump_user_state(repaired_state)
     repaired_meta = dump_meta(repaired_state)
-    key_ctx = %{key: state.key, prefix: state.prefix}
+    key_ctx = %{key: state.key, prefix: state.prefix, supervisor: state.supervisor}
 
     case StorageBackend.update_object(
            state.object_store,
@@ -2931,21 +2940,29 @@ defmodule DurableServer do
   def fetch_stored_state(supervisor_name, %{key: key, prefix: prefix}, opts)
       when is_atom(supervisor_name) do
     %{storage_backend: storage_backend} = DurableServer.Supervisor.__get_config__(supervisor_name)
-    fetch_stored_state(storage_backend, %{key: key, prefix: prefix}, opts)
+
+    fetch_stored_state(
+      storage_backend,
+      %{key: key, prefix: prefix, supervisor: supervisor_name},
+      opts
+    )
   end
 
-  def fetch_stored_state(%ObjectStore{} = store, %{key: key, prefix: prefix}, opts) do
+  def fetch_stored_state(%ObjectStore{} = store, %{key: _key, prefix: _prefix} = request, opts) do
     backend = StorageBackend.new(DurableServer.Backends.ObjectStore, store)
-    fetch_stored_state(backend, %{key: key, prefix: prefix}, opts)
+    fetch_stored_state(backend, request, opts)
   end
 
-  def fetch_stored_state(%StorageBackend{} = store, %{key: key, prefix: prefix}, opts) do
+  def fetch_stored_state(%StorageBackend{} = store, %{key: key, prefix: prefix} = request, opts) do
     opts = Keyword.validate!(opts, [:consistent])
 
     case StorageBackend.get_object(store, prefix <> key, opts) do
       {:ok, %{body: %StoredState{} = stored_state, etag: etag}} ->
         {:ok,
-         attach_stored_state_context(%{stored_state | etag: etag}, %{key: key, prefix: prefix})}
+         attach_stored_state_context(
+           %{stored_state | etag: etag},
+           stored_state_context(stored_state, request)
+         )}
 
       {:ok, %{body: other}} ->
         {:error, {:unexpected_value_type, other}}
@@ -2976,6 +2993,17 @@ defmodule DurableServer do
       kind, reason ->
         {:error, {kind, reason}}
     end
+  end
+
+  @doc false
+  def check_lock(%Meta{} = meta, supervisor_name) when is_atom(supervisor_name) do
+    check_lock(
+      meta_with_runtime_context(meta, %{
+        key: meta.key,
+        prefix: meta.prefix,
+        supervisor: supervisor_name
+      })
+    )
   end
 
   @doc false
@@ -3259,7 +3287,8 @@ defmodule DurableServer do
              state.object_store,
              %{
                key: state.key,
-               prefix: state.prefix
+               prefix: state.prefix,
+               supervisor: state.supervisor
              },
              %{},
              consistent: true
@@ -3392,7 +3421,11 @@ defmodule DurableServer do
       {:ok, %{body: %StoredState{} = stored_state, etag: etag}} ->
         updated_data =
           stored_state
-          |> attach_stored_state_context(%{key: state.key, prefix: state.prefix})
+          |> attach_stored_state_context(%{
+            key: state.key,
+            prefix: state.prefix,
+            supervisor: state.supervisor
+          })
           |> Map.put(:meta, updated_meta)
 
         case put_object(%{state | etag: etag}, storage_key, updated_data) do
@@ -3410,13 +3443,39 @@ defmodule DurableServer do
 
   defp attach_stored_state_context(%StoredState{meta: %Meta{} = meta} = stored_state, %{
          key: key,
-         prefix: prefix
+         prefix: prefix,
+         supervisor: supervisor
        }) do
     %StoredState{
       stored_state
       | key: key,
         prefix: prefix,
-        meta: %{meta | key: key, prefix: prefix}
+        meta: meta_with_runtime_context(meta, %{key: key, prefix: prefix, supervisor: supervisor})
+    }
+  end
+
+  defp stored_state_context(%StoredState{meta: %Meta{}}, %{
+         key: key,
+         prefix: prefix,
+         supervisor: supervisor
+       }) do
+    %{key: key, prefix: prefix, supervisor: supervisor}
+  end
+
+  defp stored_state_context(%StoredState{meta: %Meta{} = meta}, %{key: key, prefix: prefix}) do
+    %{key: key, prefix: prefix, supervisor: meta.supervisor}
+  end
+
+  defp meta_with_runtime_context(%Meta{} = meta, %{
+         key: key,
+         prefix: prefix,
+         supervisor: supervisor
+       }) do
+    %{
+      meta
+      | key: key,
+        prefix: prefix,
+        supervisor: supervisor
     }
   end
 
