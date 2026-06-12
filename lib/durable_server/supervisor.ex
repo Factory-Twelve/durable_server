@@ -1335,6 +1335,40 @@ defmodule DurableServer.Supervisor do
   end
 
   defp handle_already_started_race(
+         _supervisor,
+         _module,
+         _init_arg,
+         _boot_info,
+         _key,
+         :deleting,
+         _retries,
+         _deadline_ms,
+         _reply_to
+       ) do
+    {:error, {:already_started, :deleting}}
+  end
+
+  defp handle_already_started_race(
+         supervisor,
+         module,
+         init_arg,
+         boot_info,
+         _key,
+         :noproc,
+         retries,
+         deadline_ms,
+         reply_to
+       ) do
+    do_start_child(
+      supervisor,
+      {module, init_arg, boot_info},
+      retries + 1,
+      deadline_ms,
+      reply_to
+    )
+  end
+
+  defp handle_already_started_race(
          supervisor,
          module,
          init_arg,
@@ -1344,7 +1378,8 @@ defmodule DurableServer.Supervisor do
          retries,
          deadline_ms,
          reply_to
-       ) do
+       )
+       when is_pid(pid) do
     # wait up to 100ms * max retries (2.5s) for metadata to be synced before giving up on retries
     if retries > 0, do: Process.sleep(250)
 
@@ -2226,6 +2261,12 @@ defmodule DurableServer.Supervisor do
   defp normalize_already_started_result(_supervisor, _key, {pid, meta}, _deadline_ms)
        when is_pid(pid),
        do: {:ok, {pid, meta}}
+
+  defp normalize_already_started_result(_supervisor, _key, :deleting, _deadline_ms),
+    do: {:error, {:already_started, :deleting}}
+
+  defp normalize_already_started_result(_supervisor, _key, :noproc, _deadline_ms),
+    do: {:error, {:unreachable, :noproc}}
 
   defp normalize_already_started_result(supervisor, key, pid, deadline_ms) when is_pid(pid) do
     await_group_registration_or_unreachable(

@@ -2577,6 +2577,10 @@ defmodule DurableServer do
 
   defp maybe_notify_cordon_requester(%DurableServer{}, _result), do: :ok
 
+  defp maybe_sync_final_status(%DurableServer{} = state, :deleting) do
+    sync_delete_tombstone_to_storage(state)
+  end
+
   defp maybe_sync_final_status(%DurableServer{} = state, status) when is_atom(status) do
     report_sync_and_stop = state.terminator_handled and status == :stopped_graceful
 
@@ -2599,6 +2603,52 @@ defmodule DurableServer do
 
         {:error, sync_reason}
     end
+  end
+
+  defp sync_delete_tombstone_to_storage(%DurableServer{} = state) do
+    old_user_state = state.user_state
+    old_last_synced_user_state_hash = state.last_synced_user_state_hash
+    {%DurableServer{} = new_state, _dumped_user_state} = dump_user_state(state)
+    user_state_changed? = new_state.last_synced_user_state_hash != old_last_synced_user_state_hash
+    now_ms = System.system_time(:millisecond)
+
+    new_state = %{new_state | last_heartbeat_at: now_ms}
+
+    data = %StoredState{
+      vsn: new_state.vsn,
+      state: %{},
+      meta: delete_tombstone_meta(new_state, now_ms)
+    }
+
+    case put_object(new_state, storage_key(new_state), data) do
+      {:ok, %DurableServer{} = new_state} ->
+        synced_state = %{new_state | status: :deleting}
+
+        {:ok, %DurableServer{}} =
+          maybe_apply_handle_sync(synced_state, old_user_state, user_state_changed?)
+
+        :ok
+
+      {:error, sync_reason} ->
+        Logger.error(
+          "Failed to persist final status :deleting for #{state.key}: #{inspect(sync_reason)}"
+        )
+
+        {:error, sync_reason}
+    end
+  end
+
+  defp delete_tombstone_meta(%DurableServer{} = state, now_ms) when is_integer(now_ms) do
+    %Meta{
+      status: :deleting,
+      pid: nil,
+      supervisor: nil,
+      module: nil,
+      node_ref: nil,
+      node_str: state.node_str || to_string(Node.self()),
+      last_heartbeat_at: now_ms,
+      crash_history: []
+    }
   end
 
   defp maybe_invoke_after_terminate(
@@ -3692,7 +3742,17 @@ defmodule DurableServer do
           # increment global lock failure - we found a lock in storage but never saw it in syn
           # this indicates network partition/flapping
           maybe_increment_global_lock_failures(state)
-          {:error, {:already_started, meta.pid}}
+
+          cond do
+            Meta.deleting?(meta) ->
+              {:error, {:already_started, :deleting}}
+
+            is_pid(meta.pid) ->
+              {:error, {:already_started, meta.pid}}
+
+            true ->
+              {:error, {:already_started, :noproc}}
+          end
 
         :error ->
           {:error, {:already_started, :noproc}}
