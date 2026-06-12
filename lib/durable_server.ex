@@ -1386,10 +1386,15 @@ defmodule DurableServer do
                         supervisor: supervisor_name
                       })
 
-                    if Meta.deleting?(meta) do
-                      {:error, {:deleting, etag}}
-                    else
-                      {:error, {:locked, meta.pid}}
+                    cond do
+                      Meta.deleting?(meta) ->
+                        {:error, {:deleting, etag}}
+
+                      Meta.cordoned?(meta) ->
+                        {:ok, deleting_data}
+
+                      true ->
+                        {:error, {:locked, meta.pid}}
                     end
 
                   %{body: %StoredState{}, etag: etag} when etag != current_etag ->
@@ -1403,20 +1408,26 @@ defmodule DurableServer do
                         supervisor: supervisor_name
                       })
 
-                    case check_lock(stored_state.meta, supervisor_name) do
-                      :expired ->
-                        Logger.info(
-                          "delete: #{storage_key} found to be expired, claimed expired key"
-                        )
+                    if Meta.cordoned?(stored_state.meta) do
+                      Logger.info("delete: #{storage_key} found to be cordoned, claimed key")
 
-                        {:ok, deleting_data}
+                      {:ok, deleting_data}
+                    else
+                      case check_lock(stored_state.meta, supervisor_name) do
+                        :expired ->
+                          Logger.info(
+                            "delete: #{storage_key} found to be expired, claimed expired key"
+                          )
 
-                      {:locked, lock_pid} ->
-                        Logger.info(
-                          "delete: cannot claim lock for delete on #{storage_key} - locked by #{inspect(lock_pid)}"
-                        )
+                          {:ok, deleting_data}
 
-                        {:error, {:locked, lock_pid}}
+                        {:locked, lock_pid} ->
+                          Logger.info(
+                            "delete: cannot claim lock for delete on #{storage_key} - locked by #{inspect(lock_pid)}"
+                          )
+
+                          {:error, {:locked, lock_pid}}
+                      end
                     end
 
                   %{body: other, etag: _etag} ->

@@ -3760,6 +3760,61 @@ defmodule DurableServerTest do
       refute_process_down(new_pid)
     end
 
+    test "terminate_and_delete_child/2 with key deletes cordoned storage through tombstone CAS" do
+      parent = self()
+
+      after_put = fn _state, key, data, opts, result ->
+        send(parent, {:consistency_probe_put, key, data, opts, result})
+      end
+
+      {supervisor_name, _supervisor_pid, prefix} =
+        start_test_supervisor(
+          backend: {ConsistencyProbeBackend, owner: self(), after_put: after_put}
+        )
+
+      %{storage_backend: store} = DurableServer.Supervisor.__get_config__(supervisor_name)
+      table = backend_table(store)
+      key = "delete_cordoned_#{DurableServer.UUID.uuid4()}"
+      storage_key = prefix <> key
+
+      cordoned_state = %StoredState{
+        vsn: 1,
+        state: %{count: 7},
+        meta: %Meta{
+          status: :cordoned,
+          module: TestServer,
+          pid: nil,
+          supervisor: supervisor_name,
+          node_ref: nil,
+          node_str: to_string(Node.self()),
+          last_heartbeat_at: System.system_time(:millisecond),
+          crash_history: []
+        }
+      }
+
+      :ets.insert(table, {{:data, storage_key}, %{body: cordoned_state, etag: "cordoned"}})
+
+      assert :ok = DurableServer.Supervisor.terminate_and_delete_child(supervisor_name, key)
+
+      assert_receive {:consistency_probe_put, ^storage_key,
+                      %StoredState{
+                        state: %{},
+                        meta: %Meta{
+                          status: :deleting,
+                          pid: nil,
+                          module: nil,
+                          node_ref: nil,
+                          supervisor: nil
+                        }
+                      }, [etag: "cordoned"], {:ok, %{etag: tombstone_etag}}},
+                     2_000
+
+      assert_receive {:consistency_probe_delete, ^storage_key, [etag: ^tombstone_etag]}, 2_000
+
+      assert {:error, :not_found} =
+               StorageBackend.get_object(store, storage_key, consistent: true)
+    end
+
     test "terminate_and_cordon_child/2 with key retries when lock pid exits before accepting",
          %{
            supervisor_name: supervisor_name,
