@@ -12,6 +12,7 @@ It implements fault-tolerant, stateful processes that can survive node failures,
 - **Sticky placement**: Environment variable-based placement preferences (e.g., same machine, same region, etc.) with time-gated fallback to ensure servers restart on preferred nodes when possible
 - **Automatic recovery**: Failed processes are detected and restarted across the cluster
 - **Graceful shutdown**: Ensures state is synchronized before termination
+- **Administrative cordon**: Stop a server and block all automatic or explicit restarts until uncordoned
 - **Lifecycle monitoring & dispatch**: Monitor lifecycle events and dispatch messages between DurableServers and other processes
 - **Pluggable backends**: Run with object storage, EKV, or a dual-backend migration adapter
 
@@ -97,6 +98,33 @@ GenServer.call(pid, :get_count)  # => 2
 passes it through `dump_state/1`, the configured backend's encode/decode path,
 and then `load_state/2` before `init/1` or `init/2`. The dumped initial state
 must therefore be encodable by your configured backend.
+
+## Administrative Cordon
+
+Use `terminate_and_cordon_child/3` when you need to stop a DurableServer and
+make it ineligible for any future starts until an operator explicitly clears the
+cordon.
+
+```elixir
+# Stop a running child and persist status: :cordoned
+:ok = DurableServer.Supervisor.terminate_and_cordon_child(MyDurableSup, pid)
+
+# Or cordon by key. If the child is not running, storage is updated directly.
+:ok = DurableServer.Supervisor.terminate_and_cordon_child(MyDurableSup, "user_123")
+
+# Later, allow explicit starts and LifecycleManager recovery again.
+:ok = DurableServer.Supervisor.uncordon_child(MyDurableSup, "user_123")
+```
+
+A cordoned object stores `status: :cordoned`. While cordoned:
+
+- `start_child/3` and `ensure_started_child/3` return `{:error, :cordoned}`
+- LifecycleManager skips the object, even when it is permanent
+- restart claims treat the object as not eligible
+
+When cordoning by key, DurableServer uses the same lock/orphan checks as normal
+startup before updating storage. A live owner is asked to persist the cordoned
+status itself; an orphaned owner is only replaced after the lock is expired.
 
 ## Storage Backends
 

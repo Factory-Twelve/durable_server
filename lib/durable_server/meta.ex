@@ -30,6 +30,7 @@ defmodule DurableServer.Meta do
   @crashed :crashed
   @permanently_crashed :permanently_crashed
   @deleting :deleting
+  @cordoned :cordoned
 
   @statuses [
     @stopped_graceful,
@@ -37,7 +38,8 @@ defmodule DurableServer.Meta do
     @running,
     @crashed,
     @permanently_crashed,
-    @deleting
+    @deleting,
+    @cordoned
   ]
 
   # note we are using struct! so keys cannot be removed (but can be added)
@@ -146,6 +148,8 @@ defmodule DurableServer.Meta do
   def stopped_graceful?(%Meta{} = meta), do: meta.status == @stopped_graceful
 
   def deleting?(%Meta{} = meta), do: meta.status == @deleting
+
+  def cordoned?(%Meta{} = meta), do: meta.status == @cordoned
 
   def permanently_crashed?(%Meta{} = meta), do: meta.status == @permanently_crashed
 

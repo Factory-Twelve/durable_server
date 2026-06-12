@@ -860,6 +860,8 @@ defmodule DurableServer do
             last_synced_user_state_hash: nil,
             final_status_set: nil,
             terminator_handled: false,
+            delete_requester: nil,
+            cordon_requester: nil,
             permanent: false,
             was_permanently_crashed: false,
             user_initiated_stop: nil,
@@ -1209,9 +1211,13 @@ defmodule DurableServer do
   defp reread_expired_state(%StorageBackend{} = store, %{key: _key, prefix: _prefix} = request) do
     case fetch_stored_state(store, request, consistent: true) do
       {:ok, %StoredState{meta: %Meta{} = meta} = stored_state} ->
-        case check_lock(meta, Map.fetch!(request, :supervisor)) do
-          :expired -> {:ok, stored_state}
-          {:locked, lock_pid} -> {:error, {:already_started, lock_pid}}
+        if Meta.cordoned?(meta) do
+          {:error, :cordoned}
+        else
+          case check_lock(meta, Map.fetch!(request, :supervisor)) do
+            :expired -> {:ok, stored_state}
+            {:locked, lock_pid} -> {:error, {:already_started, lock_pid}}
+          end
         end
 
       {:error, :not_found} ->
@@ -1464,6 +1470,9 @@ defmodule DurableServer do
 
           {:error, :timeout} ->
             delete_with_lock_attempt(key, timeout, config)
+
+          {:error, reason} ->
+            {:error, reason}
         end
 
       nil ->
@@ -1522,7 +1531,7 @@ defmodule DurableServer do
   end
 
   defp delete_by_pid(pid, timeout) when is_pid(pid) and is_integer(timeout) do
-    start_time = System.system_time(:millisecond)
+    deadline = System.monotonic_time(:millisecond) + timeout
     ref = make_ref()
     monitor_ref = Process.monitor(pid)
     send(pid, {@durable, {:delete_request, ref, self()}})
@@ -1530,15 +1539,8 @@ defmodule DurableServer do
     receive do
       # process is shutting down and attempting to delete itself
       {:delete_in_progress, ^ref} ->
-        Logger.info("Process #{inspect(pid)} completed self-deletion")
-        remaining_timeout = timeout - (System.system_time(:millisecond) - start_time)
-
-        # await shutdown
-        receive do
-          {:DOWN, ^monitor_ref, :process, ^pid, _} -> :ok
-        after
-          remaining_timeout -> {:error, :timeout}
-        end
+        Logger.info("Process #{inspect(pid)} accepted delete request")
+        await_delete_completion(pid, ref, monitor_ref, deadline, nil, nil)
 
       # process is dead and did not process our delete request
       {:DOWN, ^monitor_ref, :process, ^pid, _} ->
@@ -1547,6 +1549,282 @@ defmodule DurableServer do
       timeout -> {:error, :timeout}
     end
   end
+
+  defp await_delete_completion(_pid, _ref, monitor_ref, _deadline, :ok, down_reason)
+       when not is_nil(down_reason) do
+    Process.demonitor(monitor_ref, [:flush])
+    :ok
+  end
+
+  defp await_delete_completion(_pid, _ref, monitor_ref, _deadline, {:error, reason}, down_reason)
+       when not is_nil(down_reason) do
+    Process.demonitor(monitor_ref, [:flush])
+    {:error, reason}
+  end
+
+  defp await_delete_completion(pid, ref, monitor_ref, deadline, delete_result, down_reason) do
+    remaining_timeout = max(deadline - System.monotonic_time(:millisecond), 0)
+
+    if remaining_timeout <= 0 do
+      delete_timeout_result(delete_result, down_reason)
+    else
+      receive do
+        {:delete_complete, ^ref, :ok} ->
+          await_delete_completion(pid, ref, monitor_ref, deadline, :ok, down_reason)
+
+        {:delete_complete, ^ref, {:error, _reason} = result} ->
+          await_delete_completion(pid, ref, monitor_ref, deadline, result, down_reason)
+
+        {:DOWN, ^monitor_ref, :process, ^pid, reason} ->
+          await_delete_completion(pid, ref, monitor_ref, deadline, delete_result, reason)
+      after
+        remaining_timeout ->
+          delete_timeout_result(delete_result, down_reason)
+      end
+    end
+  end
+
+  defp delete_timeout_result({:error, reason}, _down_reason), do: {:error, reason}
+  defp delete_timeout_result(:ok, nil), do: {:error, :timeout}
+  defp delete_timeout_result(nil, nil), do: {:error, :timeout}
+
+  defp delete_timeout_result(nil, down_reason),
+    do: {:error, {:delete_not_confirmed, down_reason}}
+
+  defp delete_timeout_result(:ok, _down_reason), do: :ok
+
+  @doc false
+  def __cordon_request__(_supervisor, pid, timeout, _config)
+      when is_pid(pid) and is_integer(timeout) do
+    cordon_by_pid(pid, timeout)
+  end
+
+  def __cordon_request__(supervisor_name, key, timeout, config)
+      when is_atom(supervisor_name) and is_binary(key) and is_integer(timeout) do
+    cordon_key_attempt(supervisor_name, key, timeout, config, _retries = 1)
+  end
+
+  @doc false
+  def __uncordon_request__(supervisor_name, key, config)
+      when is_atom(supervisor_name) and is_binary(key) do
+    uncordon_key_attempt(supervisor_name, key, config, _retries = 1)
+  end
+
+  defp cordon_key_attempt(supervisor_name, key, timeout, config, retries) do
+    %{prefix: prefix, storage_backend: store} = config
+    storage_key = prefix <> key
+
+    case fetch_stored_state(store, %{key: key, prefix: prefix, supervisor: supervisor_name},
+           consistent: true
+         ) do
+      {:ok, %StoredState{meta: %Meta{} = meta} = stored_state} ->
+        cond do
+          Meta.cordoned?(meta) ->
+            :ok
+
+          Meta.deleting?(meta) ->
+            {:error, {:locked, :deleting}}
+
+          Meta.running?(meta) ->
+            case check_lock(meta, supervisor_name) do
+              {:locked, pid} when is_pid(pid) ->
+                case cordon_by_pid(pid, timeout) do
+                  {:error, :noproc} when retries > 0 ->
+                    cordon_key_attempt(supervisor_name, key, timeout, config, retries - 1)
+
+                  {:error, {:cordon_not_confirmed, _reason}} when retries > 0 ->
+                    cordon_key_attempt(supervisor_name, key, timeout, config, retries - 1)
+
+                  other ->
+                    other
+                end
+
+              {:locked, lock_pid} ->
+                {:error, {:locked, lock_pid}}
+
+              :expired ->
+                put_cordoned_stored_state(
+                  store,
+                  storage_key,
+                  stored_state,
+                  fn ->
+                    cordon_key_attempt(supervisor_name, key, timeout, config, retries - 1)
+                  end,
+                  retries
+                )
+            end
+
+          true ->
+            put_cordoned_stored_state(
+              store,
+              storage_key,
+              stored_state,
+              fn -> cordon_key_attempt(supervisor_name, key, timeout, config, retries - 1) end,
+              retries
+            )
+        end
+
+      {:error, :not_found} ->
+        {:error, :not_found}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp uncordon_key_attempt(supervisor_name, key, config, retries) do
+    %{prefix: prefix, storage_backend: store} = config
+    storage_key = prefix <> key
+
+    case fetch_stored_state(store, %{key: key, prefix: prefix, supervisor: supervisor_name},
+           consistent: true
+         ) do
+      {:ok, %StoredState{meta: %Meta{} = meta} = stored_state} ->
+        if Meta.cordoned?(meta) do
+          put_uncordoned_stored_state(
+            store,
+            storage_key,
+            stored_state,
+            fn -> uncordon_key_attempt(supervisor_name, key, config, retries - 1) end,
+            retries
+          )
+        else
+          :ok
+        end
+
+      {:error, :not_found} ->
+        {:error, :not_found}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp put_cordoned_stored_state(
+         store,
+         storage_key,
+         %StoredState{} = stored_state,
+         rerun_key_flow,
+         retries
+       ) do
+    updated_meta =
+      stored_state.meta
+      |> Meta.put_status(:cordoned)
+      |> Meta.clear_restart_attempt()
+
+    put_status_stored_state(
+      store,
+      storage_key,
+      %{stored_state | meta: updated_meta},
+      rerun_key_flow,
+      retries
+    )
+  end
+
+  defp put_uncordoned_stored_state(
+         store,
+         storage_key,
+         %StoredState{} = stored_state,
+         rerun_key_flow,
+         retries
+       ) do
+    updated_meta =
+      stored_state.meta
+      |> Meta.put_status(:stopped_graceful)
+      |> Meta.clear_restart_attempt()
+
+    put_status_stored_state(
+      store,
+      storage_key,
+      %{stored_state | meta: updated_meta},
+      rerun_key_flow,
+      retries
+    )
+  end
+
+  defp put_status_stored_state(
+         %StorageBackend{} = store,
+         storage_key,
+         %StoredState{etag: etag} = stored_state,
+         rerun_key_flow,
+         retries
+       )
+       when is_binary(storage_key) and is_function(rerun_key_flow, 0) do
+    case StorageBackend.put_object(store, storage_key, stored_state, etag: etag) do
+      {:ok, _object} ->
+        :ok
+
+      {:error, :conflict} when retries > 0 ->
+        # Conflict means our lock view is stale. Re-enter the key flow so the
+        # next attempt performs a consistent read and fresh lock/orphan check.
+        rerun_key_flow.()
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp cordon_by_pid(pid, timeout) when is_pid(pid) and is_integer(timeout) do
+    deadline = System.monotonic_time(:millisecond) + timeout
+    ref = make_ref()
+    monitor_ref = Process.monitor(pid)
+    send(pid, {@durable, {:cordon_request, ref, self()}})
+
+    receive do
+      {:cordon_in_progress, ^ref} ->
+        Logger.info("Process #{inspect(pid)} accepted cordon request")
+        await_cordon_completion(pid, ref, monitor_ref, deadline, nil, nil)
+
+      {:DOWN, ^monitor_ref, :process, ^pid, _} ->
+        {:error, :noproc}
+    after
+      timeout ->
+        {:error, :timeout}
+    end
+  end
+
+  defp await_cordon_completion(_pid, _ref, monitor_ref, _deadline, :ok, down_reason)
+       when not is_nil(down_reason) do
+    Process.demonitor(monitor_ref, [:flush])
+    :ok
+  end
+
+  defp await_cordon_completion(_pid, _ref, monitor_ref, _deadline, {:error, reason}, down_reason)
+       when not is_nil(down_reason) do
+    Process.demonitor(monitor_ref, [:flush])
+    {:error, reason}
+  end
+
+  defp await_cordon_completion(pid, ref, monitor_ref, deadline, cordon_result, down_reason) do
+    remaining_timeout = max(deadline - System.monotonic_time(:millisecond), 0)
+
+    if remaining_timeout <= 0 do
+      cordon_timeout_result(cordon_result, down_reason)
+    else
+      receive do
+        {:cordon_complete, ^ref, :ok} ->
+          await_cordon_completion(pid, ref, monitor_ref, deadline, :ok, down_reason)
+
+        {:cordon_complete, ^ref, {:error, _reason} = result} ->
+          await_cordon_completion(pid, ref, monitor_ref, deadline, result, down_reason)
+
+        {:DOWN, ^monitor_ref, :process, ^pid, reason} ->
+          await_cordon_completion(pid, ref, monitor_ref, deadline, cordon_result, reason)
+      after
+        remaining_timeout ->
+          cordon_timeout_result(cordon_result, down_reason)
+      end
+    end
+  end
+
+  defp cordon_timeout_result({:error, reason}, _down_reason), do: {:error, reason}
+  defp cordon_timeout_result(:ok, nil), do: {:error, :timeout}
+  defp cordon_timeout_result(nil, nil), do: {:error, :timeout}
+
+  defp cordon_timeout_result(nil, down_reason),
+    do: {:error, {:cordon_not_confirmed, down_reason}}
+
+  defp cordon_timeout_result(:ok, _down_reason), do: :ok
 
   @doc false
   def claim_restart_attempt(%ObjectStore{} = store, %StoredState{} = stored_state, opts) do
@@ -1592,6 +1870,9 @@ defmodule DurableServer do
     cond do
       Meta.currently_restarting?(meta) ->
         {:error, :already_claimed}
+
+      Meta.cordoned?(meta) ->
+        {:error, :not_eligible}
 
       Meta.stopped_permanently?(meta) ->
         {:error, :not_eligible}
@@ -1788,10 +2069,31 @@ defmodule DurableServer do
 
     # Defer status persistence to terminate/2 after user callback terminate/2 has run.
     updated_state =
-      %{state | user_initiated_stop: {:shutdown, :delete}, final_status_set: :deleting}
+      %{
+        state
+        | user_initiated_stop: {:shutdown, :delete},
+          final_status_set: :deleting,
+          delete_requester: {requester_pid, ref}
+      }
 
     # stop with delete reason to trigger deletion in terminate/2
     {:stop, {:shutdown, :delete}, updated_state}
+  end
+
+  def handle_info({@durable, {:cordon_request, ref, requester_pid}}, %__MODULE__{} = state) do
+    Logger.info(
+      "DurableServer #{state.key} received cordon request from #{inspect(requester_pid)}"
+    )
+
+    send(requester_pid, {:cordon_in_progress, ref})
+
+    updated_state = %{
+      state
+      | final_status_set: :cordoned,
+        cordon_requester: {requester_pid, ref}
+    }
+
+    {:stop, :normal, updated_state}
   end
 
   def handle_info(msg, %DurableServer{} = state) do
@@ -1828,7 +2130,7 @@ defmodule DurableServer do
     # Ensure user callback terminate/2 finishes before we persist final status metadata.
     terminate_return = state.module.terminate(reason, state.user_state)
 
-    {final_status, sync_result} =
+    {final_status, sync_result, delete_result} =
       case state.user_initiated_stop do
         nil ->
           handle_external_terminate(reason, state)
@@ -1838,6 +2140,8 @@ defmodule DurableServer do
       end
 
     maybe_invoke_after_terminate(state, terminate_return, reason, final_status, sync_result)
+    maybe_notify_delete_requester(state, delete_result)
+    maybe_notify_cordon_requester(state, sync_result)
   end
 
   defp bootstrap_init(
@@ -1876,50 +2180,56 @@ defmodule DurableServer do
           {:ok, %StoredState{} = existing} ->
             %{meta: %Meta{} = meta} = existing
 
-            case active_restart_claim(meta, boot_info, current_node_str) do
-              {:claimed, claimant_node} ->
-                {:error, {:restart_claimed, claimant_node}}
+            if Meta.cordoned?(meta) do
+              {:error, :cordoned}
+            else
+              case active_restart_claim(meta, boot_info, current_node_str) do
+                {:claimed, claimant_node} ->
+                  {:error, {:restart_claimed, claimant_node}}
 
-              :ok ->
-                case check_lock(meta, supervisor_name) do
-                  {:locked, lock_pid} ->
-                    {:error, {:already_started, lock_pid}}
+                :ok ->
+                  case check_lock(meta, supervisor_name) do
+                    {:locked, lock_pid} ->
+                      {:error, {:already_started, lock_pid}}
 
-                  :expired ->
-                    if Meta.deleting?(meta) do
-                      load_fresh_init_state(module, init_arg, object_store, etag: existing.etag)
-                    else
-                      if preloaded_boot do
-                        loaded_state = load_user_state(module, existing.vsn, existing.state)
-                        {:ok, {loaded_state, existing.vsn, existing.etag, meta}}
+                    :expired ->
+                      if Meta.deleting?(meta) do
+                        load_fresh_init_state(module, init_arg, object_store, etag: existing.etag)
                       else
-                        case reread_expired_state(object_store, %{
-                               key: key,
-                               prefix: prefix,
-                               supervisor: supervisor_name
-                             }) do
-                          {:ok,
-                           %StoredState{
-                             meta: %Meta{} = current_meta,
-                             vsn: current_vsn,
-                             state: current_raw_state,
-                             etag: current_etag
-                           }} ->
-                            loaded_state = load_user_state(module, current_vsn, current_raw_state)
-                            {:ok, {loaded_state, current_vsn, current_etag, current_meta}}
+                        if preloaded_boot do
+                          loaded_state = load_user_state(module, existing.vsn, existing.state)
+                          {:ok, {loaded_state, existing.vsn, existing.etag, meta}}
+                        else
+                          case reread_expired_state(object_store, %{
+                                 key: key,
+                                 prefix: prefix,
+                                 supervisor: supervisor_name
+                               }) do
+                            {:ok,
+                             %StoredState{
+                               meta: %Meta{} = current_meta,
+                               vsn: current_vsn,
+                               state: current_raw_state,
+                               etag: current_etag
+                             }} ->
+                              loaded_state =
+                                load_user_state(module, current_vsn, current_raw_state)
 
-                          {:error, {:already_started, lock_pid}} ->
-                            {:error, {:already_started, lock_pid}}
+                              {:ok, {loaded_state, current_vsn, current_etag, current_meta}}
 
-                          :error ->
-                            load_fresh_init_state(module, init_arg, object_store)
+                            {:error, {:already_started, lock_pid}} ->
+                              {:error, {:already_started, lock_pid}}
 
-                          {:error, reason} ->
-                            {:error, reason}
+                            :error ->
+                              load_fresh_init_state(module, init_arg, object_store)
+
+                            {:error, reason} ->
+                              {:error, reason}
+                          end
                         end
                       end
-                    end
-                end
+                  end
+              end
             end
 
           :error ->
@@ -2052,18 +2362,22 @@ defmodule DurableServer do
         final_status = state.final_status_set || :deleting
         sync_result = maybe_sync_final_status(state, final_status)
 
-        case StorageBackend.delete_object(state.object_store, storage_key(state)) do
-          :ok ->
-            Logger.info("Successfully deleted storage for #{state.key}")
+        delete_result =
+          case StorageBackend.delete_object(state.object_store, storage_key(state)) do
+            :ok ->
+              Logger.info("Successfully deleted storage for #{state.key}")
+              :ok
 
-          {:error, :not_found} ->
-            Logger.info("Storage already deleted for #{state.key}")
+            {:error, :not_found} ->
+              Logger.info("Storage already deleted for #{state.key}")
+              :ok
 
-          {:error, reason} ->
-            Logger.error("Failed to delete storage for #{state.key}: #{inspect(reason)}")
-        end
+            {:error, reason} ->
+              Logger.error("Failed to delete storage for #{state.key}: #{inspect(reason)}")
+              {:error, reason}
+          end
 
-        {final_status, sync_result}
+        {final_status, sync_result, delete_result}
 
       user_stop
       when user_stop in [:normal, :permanent, {:shutdown, :permanent}, {:shutdown, :normal}] ->
@@ -2080,7 +2394,7 @@ defmodule DurableServer do
           "DurableServer #{state.key} shutting down gracefully via user stop (#{inspect(user_stop)})"
         )
 
-        {final_status, sync_result}
+        {final_status, sync_result, nil}
 
       {:error, error_reason} ->
         final_status = state.final_status_set || :crashed
@@ -2088,7 +2402,7 @@ defmodule DurableServer do
 
         Logger.info("DurableServer #{state.key} stopping with error (#{inspect(error_reason)})")
 
-        {final_status, sync_result}
+        {final_status, sync_result, nil}
     end
   end
 
@@ -2097,7 +2411,7 @@ defmodule DurableServer do
     case state.final_status_set do
       status when not is_nil(status) ->
         sync_result = maybe_sync_final_status(state, status)
-        {status, sync_result}
+        {status, sync_result, nil}
 
       nil ->
         case reason do
@@ -2109,7 +2423,7 @@ defmodule DurableServer do
 
             final_status = :stopped_graceful
             sync_result = maybe_sync_final_status(state, final_status)
-            {final_status, sync_result}
+            {final_status, sync_result, nil}
 
           {:shutdown, _} ->
             # external graceful shutdown (e.g., supervisor terminate_child)
@@ -2119,10 +2433,10 @@ defmodule DurableServer do
 
             final_status = :stopped_graceful
             sync_result = maybe_sync_final_status(state, final_status)
-            {final_status, sync_result}
+            {final_status, sync_result, nil}
 
           :normal ->
-            {nil, :ok}
+            {nil, :ok, nil}
 
           _crash_reason ->
             # this is a crash - update status using crash tracking system
@@ -2181,10 +2495,47 @@ defmodule DurableServer do
                 end
             end
 
-            {final_status, :ok}
+            {final_status, :ok, nil}
         end
     end
   end
+
+  defp maybe_notify_delete_requester(
+         %DurableServer{delete_requester: {requester_pid, ref}},
+         result
+       )
+       when is_pid(requester_pid) and is_reference(ref) do
+    send(requester_pid, {:delete_complete, ref, result || {:error, :delete_not_attempted}})
+    :ok
+  end
+
+  defp maybe_notify_delete_requester(%DurableServer{}, _result), do: :ok
+
+  defp maybe_notify_cordon_requester(
+         %DurableServer{cordon_requester: {requester_pid, ref}},
+         :ok
+       )
+       when is_pid(requester_pid) and is_reference(ref) do
+    send(requester_pid, {:cordon_complete, ref, :ok})
+    :ok
+  end
+
+  defp maybe_notify_cordon_requester(
+         %DurableServer{cordon_requester: {requester_pid, ref}},
+         {:error, reason}
+       )
+       when is_pid(requester_pid) and is_reference(ref) do
+    send(requester_pid, {:cordon_complete, ref, {:error, reason}})
+    :ok
+  end
+
+  defp maybe_notify_cordon_requester(%DurableServer{cordon_requester: {requester_pid, ref}}, _)
+       when is_pid(requester_pid) and is_reference(ref) do
+    send(requester_pid, {:cordon_complete, ref, {:error, :cordon_not_confirmed}})
+    :ok
+  end
+
+  defp maybe_notify_cordon_requester(%DurableServer{}, _result), do: :ok
 
   defp maybe_sync_final_status(%DurableServer{} = state, status) when is_atom(status) do
     report_sync_and_stop = state.terminator_handled and status == :stopped_graceful
@@ -3030,6 +3381,10 @@ defmodule DurableServer do
       Meta.deleting?(meta) ->
         report_lock_diagnostic(sup_name, :check_lock_deleting)
         delete_tombstone_lock_status(meta)
+
+      Meta.cordoned?(meta) ->
+        report_lock_diagnostic(sup_name, :check_lock_cordoned)
+        {:locked, :cordoned}
 
       # if the pid lock holder wrote the graceful stop, it's gone
       Meta.stopped_graceful?(meta) ->

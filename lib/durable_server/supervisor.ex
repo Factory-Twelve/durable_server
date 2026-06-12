@@ -2629,6 +2629,36 @@ defmodule DurableServer.Supervisor do
     end
   end
 
+  @doc """
+  Terminates a DurableServer child and cordons it from future starts.
+
+  A cordoned server stores `status: :cordoned` and is ineligible for both
+  LifecycleManager restarts and explicit `start_child/3` or
+  `ensure_started_child/3` calls until `uncordon_child/2` is called.
+
+  If the server is running, the process performs its final persistence with
+  `status: :cordoned`. If the server is not running but has stored state, this
+  CAS-updates the stored status directly.
+  """
+  def terminate_and_cordon_child(supervisor, pid_or_key, timeout \\ 5000)
+
+  def terminate_and_cordon_child(supervisor, pid_or_key, timeout)
+      when (is_pid(pid_or_key) or is_binary(pid_or_key)) and is_integer(timeout) do
+    config = __get_config__(supervisor)
+    DurableServer.__cordon_request__(supervisor, pid_or_key, timeout, config)
+  end
+
+  @doc """
+  Clears a cordon by changing `status: :cordoned` back to `:stopped_graceful`.
+
+  This makes the server eligible for explicit starts again. If the server is
+  permanent, LifecycleManager may also restart it after the cordon is cleared.
+  """
+  def uncordon_child(supervisor, key) when is_atom(supervisor) and is_binary(key) do
+    config = __get_config__(supervisor)
+    DurableServer.__uncordon_request__(supervisor, key, config)
+  end
+
   defp terminate_child_for_rehome(
          supervisor_name,
          pid,
