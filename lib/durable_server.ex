@@ -3723,7 +3723,11 @@ defmodule DurableServer do
     end
   end
 
-  defp await_raced_registration_error(%DurableServer{} = state, retries \\ 0) do
+  defp await_raced_registration_error(
+         %DurableServer{} = state,
+         %StoredState{} = data,
+         retries \\ 0
+       ) do
     # wait up to 5s
     if retries > 50 do
       # we should have seen the registration come up by now, check object storage for current value
@@ -3738,14 +3742,20 @@ defmodule DurableServer do
              %{},
              consistent: true
            ) do
-        {:ok, %StoredState{meta: %Meta{} = meta}} ->
+        {:ok, %StoredState{meta: %Meta{} = meta} = stored_state} ->
           # increment global lock failure - we found a lock in storage but never saw it in syn
           # this indicates network partition/flapping
           maybe_increment_global_lock_failures(state)
 
           cond do
             Meta.deleting?(meta) ->
-              {:error, {:already_started, :deleting}}
+              case delete_tombstone_lock_status(meta) do
+                :expired ->
+                  try_lock_object_via_update(%{state | etag: stored_state.etag}, data)
+
+                {:locked, :deleting} ->
+                  {:error, {:already_started, :deleting}}
+              end
 
             is_pid(meta.pid) ->
               {:error, {:already_started, meta.pid}}
@@ -3764,7 +3774,7 @@ defmodule DurableServer do
 
         nil ->
           Process.sleep(100)
-          await_raced_registration_error(state, retries + 1)
+          await_raced_registration_error(state, data, retries + 1)
       end
     end
   end
@@ -3795,7 +3805,7 @@ defmodule DurableServer do
             "we raced the first ever claim for #{inspect(state.key)} awaiting registration (#{inspect(old_etag: state.etag)})"
           )
 
-          await_raced_registration_error(state)
+          await_raced_registration_error(state, data)
 
         {:error, reason} ->
           {:error, reason}
@@ -3823,7 +3833,7 @@ defmodule DurableServer do
           "raced the lock for #{inspect(key)} awaiting registration (#{inspect(old_etag: state.etag)})"
         )
 
-        await_raced_registration_error(state)
+        await_raced_registration_error(state, data)
 
       {:error, reason} ->
         {:error, reason}
