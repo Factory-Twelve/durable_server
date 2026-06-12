@@ -3813,6 +3813,58 @@ defmodule DurableServerTest do
       assert stored_state.meta.supervisor == nil
     end
 
+    test "explicit start confirms stale delete tombstone before blocking key reuse" do
+      {supervisor_name, _supervisor_pid, prefix} =
+        start_test_supervisor(backend: {ConsistencyProbeBackend, owner: self()})
+
+      %{storage_backend: store} = DurableServer.Supervisor.__get_config__(supervisor_name)
+      table = backend_table(store)
+      key = "delete_tombstone_stale_#{DurableServer.UUID.uuid4()}"
+      storage_key = prefix <> key
+
+      deleting_tombstone = %StoredState{
+        vsn: 1,
+        state: %{},
+        meta: %Meta{
+          status: :deleting,
+          pid: nil,
+          supervisor: nil,
+          module: nil,
+          node_ref: nil,
+          node_str: to_string(Node.self()),
+          last_heartbeat_at: System.system_time(:millisecond),
+          crash_history: []
+        }
+      }
+
+      put_backend_override(
+        table,
+        storage_key,
+        false,
+        {:ok, %{body: deleting_tombstone, etag: "stale-tombstone-etag"}}
+      )
+
+      {:ok, {pid, _meta}} =
+        DurableServer.Supervisor.start_child(
+          supervisor_name,
+          {TestServer, key: key, initial_state: %{count: 41}}
+        )
+
+      assert 41 = GenServer.call(pid, :get_count)
+      refute_process_down(pid)
+
+      get_opts = recorded_get_opts(table, storage_key)
+      assert [consistent: false] in get_opts
+      assert [consistent: true] in get_opts
+
+      {:ok, stored_state} =
+        DurableServer.fetch_stored_state(store, %{key: key, prefix: prefix}, consistent: true)
+
+      assert stored_state.meta.status == :running
+      assert stored_state.meta.pid == pid
+      assert atomify_keys(stored_state.state).count == 41
+    end
+
     test "explicit delete waits while delete tombstone is inside delete request margin" do
       {supervisor_name, _supervisor_pid, prefix} =
         start_test_supervisor(

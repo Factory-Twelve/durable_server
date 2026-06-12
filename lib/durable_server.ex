@@ -1208,6 +1208,32 @@ defmodule DurableServer do
     end
   end
 
+  defp maybe_confirm_deleting_tombstone(
+         _store,
+         _request,
+         %StoredState{} = existing,
+         _preloaded_boot = true
+       ),
+       do: {:ok, existing}
+
+  defp maybe_confirm_deleting_tombstone(
+         %StorageBackend{} = store,
+         %{key: _key, prefix: _prefix, supervisor: _supervisor_name} = request,
+         %StoredState{meta: %Meta{} = meta} = existing,
+         _preloaded_boot = false
+       ) do
+    # A stale read can observe a tombstone after DELETE already completed.
+    if Meta.deleting?(meta) do
+      case fetch_stored_state(store, request, consistent: true) do
+        {:ok, %StoredState{} = current} -> {:ok, current}
+        {:error, :not_found} -> :not_found
+        {:error, reason} -> {:error, reason}
+      end
+    else
+      {:ok, existing}
+    end
+  end
+
   defp reread_expired_state(%StorageBackend{} = store, %{key: _key, prefix: _prefix} = request) do
     case fetch_stored_state(store, request, consistent: true) do
       {:ok, %StoredState{meta: %Meta{} = meta} = stored_state} ->
@@ -2170,66 +2196,80 @@ defmodule DurableServer do
          :ok <- LifecycleManager.check_capacity(supervisor_name, module, capacity_opts) do
       current_node_str = to_string(Node.self())
 
+      storage_request = %{key: key, prefix: prefix, supervisor: supervisor_name}
+
       load_result =
         case fetch_existing_state_raw(
                object_store,
-               %{key: key, prefix: prefix, supervisor: supervisor_name},
+               storage_request,
                boot_info,
                consistent: false
              ) do
           {:ok, %StoredState{} = existing} ->
-            %{meta: %Meta{} = meta} = existing
+            case maybe_confirm_deleting_tombstone(
+                   object_store,
+                   storage_request,
+                   existing,
+                   preloaded_boot
+                 ) do
+              {:ok, %StoredState{} = existing} ->
+                %{meta: %Meta{} = meta} = existing
 
-            if Meta.cordoned?(meta) do
-              {:error, :cordoned}
-            else
-              case active_restart_claim(meta, boot_info, current_node_str) do
-                {:claimed, claimant_node} ->
-                  {:error, {:restart_claimed, claimant_node}}
+                if Meta.cordoned?(meta) do
+                  {:error, :cordoned}
+                else
+                  case active_restart_claim(meta, boot_info, current_node_str) do
+                    {:claimed, claimant_node} ->
+                      {:error, {:restart_claimed, claimant_node}}
 
-                :ok ->
-                  case check_lock(meta, supervisor_name) do
-                    {:locked, lock_pid} ->
-                      {:error, {:already_started, lock_pid}}
+                    :ok ->
+                      case check_lock(meta, supervisor_name) do
+                        {:locked, lock_pid} ->
+                          {:error, {:already_started, lock_pid}}
 
-                    :expired ->
-                      if Meta.deleting?(meta) do
-                        load_fresh_init_state(module, init_arg, object_store, etag: existing.etag)
-                      else
-                        if preloaded_boot do
-                          loaded_state = load_user_state(module, existing.vsn, existing.state)
-                          {:ok, {loaded_state, existing.vsn, existing.etag, meta}}
-                        else
-                          case reread_expired_state(object_store, %{
-                                 key: key,
-                                 prefix: prefix,
-                                 supervisor: supervisor_name
-                               }) do
-                            {:ok,
-                             %StoredState{
-                               meta: %Meta{} = current_meta,
-                               vsn: current_vsn,
-                               state: current_raw_state,
-                               etag: current_etag
-                             }} ->
-                              loaded_state =
-                                load_user_state(module, current_vsn, current_raw_state)
+                        :expired ->
+                          if Meta.deleting?(meta) do
+                            load_fresh_init_state(module, init_arg, object_store,
+                              etag: existing.etag
+                            )
+                          else
+                            if preloaded_boot do
+                              loaded_state = load_user_state(module, existing.vsn, existing.state)
+                              {:ok, {loaded_state, existing.vsn, existing.etag, meta}}
+                            else
+                              case reread_expired_state(object_store, storage_request) do
+                                {:ok,
+                                 %StoredState{
+                                   meta: %Meta{} = current_meta,
+                                   vsn: current_vsn,
+                                   state: current_raw_state,
+                                   etag: current_etag
+                                 }} ->
+                                  loaded_state =
+                                    load_user_state(module, current_vsn, current_raw_state)
 
-                              {:ok, {loaded_state, current_vsn, current_etag, current_meta}}
+                                  {:ok, {loaded_state, current_vsn, current_etag, current_meta}}
 
-                            {:error, {:already_started, lock_pid}} ->
-                              {:error, {:already_started, lock_pid}}
+                                {:error, {:already_started, lock_pid}} ->
+                                  {:error, {:already_started, lock_pid}}
 
-                            :error ->
-                              load_fresh_init_state(module, init_arg, object_store)
+                                :error ->
+                                  load_fresh_init_state(module, init_arg, object_store)
 
-                            {:error, reason} ->
-                              {:error, reason}
+                                {:error, reason} ->
+                                  {:error, reason}
+                              end
+                            end
                           end
-                        end
                       end
                   end
-              end
+                end
+
+              :not_found ->
+                load_fresh_init_state(module, init_arg, object_store)
+
+              {:error, reason} ->
+                {:error, reason}
             end
 
           :error ->
