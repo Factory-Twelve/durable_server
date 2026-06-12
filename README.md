@@ -110,7 +110,11 @@ cordon.
 :ok = DurableServer.Supervisor.terminate_and_cordon_child(MyDurableSup, pid)
 
 # Or cordon by key. If the child is not running, storage is updated directly.
-:ok = DurableServer.Supervisor.terminate_and_cordon_child(MyDurableSup, "user_123")
+:ok = DurableServer.Supervisor.terminate_and_cordon_child(
+  MyDurableSup,
+  "user_123",
+  timeout: 10_000
+)
 
 # Later, allow explicit starts and LifecycleManager recovery again.
 :ok = DurableServer.Supervisor.uncordon_child(MyDurableSup, "user_123")

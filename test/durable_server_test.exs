@@ -3675,7 +3675,10 @@ defmodule DurableServerTest do
                  consistent: true
                )
 
-      assert :ok = DurableServer.Supervisor.terminate_and_cordon_child(supervisor_name, key)
+      assert :ok =
+               DurableServer.Supervisor.terminate_and_cordon_child(supervisor_name, key,
+                 timeout: 5_000
+               )
 
       assert {:ok, %StoredState{meta: %Meta{status: :cordoned}} = stored_state} =
                DurableServer.fetch_stored_state(
@@ -3758,6 +3761,16 @@ defmodule DurableServerTest do
                  %{key: key, prefix: prefix, supervisor: supervisor_name},
                  consistent: true
                )
+    end
+
+    test "terminate_and_cordon_child/3 validates options", %{
+      supervisor_name: supervisor_name
+    } do
+      assert_raise ArgumentError, fn ->
+        DurableServer.Supervisor.terminate_and_cordon_child(supervisor_name, "missing",
+          invalid: true
+        )
+      end
     end
 
     test "explicit start waits while delete tombstone is inside its lease" do

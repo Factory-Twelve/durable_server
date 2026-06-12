@@ -2639,11 +2639,18 @@ defmodule DurableServer.Supervisor do
   If the server is running, the process performs its final persistence with
   `status: :cordoned`. If the server is not running but has stored state, this
   CAS-updates the stored status directly.
-  """
-  def terminate_and_cordon_child(supervisor, pid_or_key, timeout \\ 5000)
 
-  def terminate_and_cordon_child(supervisor, pid_or_key, timeout)
-      when (is_pid(pid_or_key) or is_binary(pid_or_key)) and is_integer(timeout) do
+  ## Options
+
+  - `:timeout` - maximum time in milliseconds to wait for a running process to
+    stop and confirm the cordon (default: `5000`)
+  """
+  def terminate_and_cordon_child(supervisor, pid_or_key, opts \\ [])
+
+  def terminate_and_cordon_child(supervisor, pid_or_key, opts)
+      when (is_pid(pid_or_key) or is_binary(pid_or_key)) and is_list(opts) do
+    opts = Keyword.validate!(opts, [:timeout])
+    timeout = Keyword.get(opts, :timeout, 5000)
     config = __get_config__(supervisor)
     DurableServer.__cordon_request__(supervisor, pid_or_key, timeout, config)
   end
