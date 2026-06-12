@@ -990,8 +990,16 @@ defmodule DurableServer.ObjectStore do
   @doc """
   Deletes an object from S3.
   """
-  def delete_object(%__MODULE__{} = client, key) do
-    req = new_req(client, consistent: true)
+  def delete_object(%__MODULE__{} = client, key, opts \\ []) do
+    opts = Keyword.validate!(opts, [:etag])
+
+    headers =
+      case Keyword.fetch(opts, :etag) do
+        {:ok, etag} when is_binary(etag) -> [{"if-match", etag}]
+        :error -> []
+      end
+
+    req = new_req(client, consistent: true, headers: headers)
 
     case Req.request(req,
            method: :delete,
@@ -1003,6 +1011,9 @@ defmodule DurableServer.ObjectStore do
 
       {:ok, %{status: 404}} ->
         {:error, :not_found}
+
+      {:ok, %{status: 412}} when headers != [] ->
+        {:error, :conflict}
 
       {:ok, %{status: 412}} ->
         {:error, :not_found}

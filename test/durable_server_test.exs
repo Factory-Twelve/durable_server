@@ -9,6 +9,7 @@ defmodule DurableServerTest do
   alias DurableServer.Meta
   alias DurableServer.StoredState
   alias DurableServer.ObjectStore
+  alias DurableServer.Backends.MirrorStore
   alias DurableServer.Backends.ObjectStore, as: ObjectStoreBackend
   alias DurableServer.StorageBackend
   alias DurableServer.TestTemporalServer
@@ -185,6 +186,15 @@ defmodule DurableServerTest do
     end)
   end
 
+  defp recorded_delete_opts(table, key) do
+    table
+    |> :ets.tab2list()
+    |> Enum.flat_map(fn
+      {{:delete_call, _call_id}, %{key: ^key, opts: opts}} -> [opts]
+      _ -> []
+    end)
+  end
+
   # Test implementation modules
   defmodule RejectingStartupSyncBackend do
     @behaviour DurableServer.StorageBackend
@@ -263,7 +273,8 @@ defmodule DurableServerTest do
            owner: Map.get(opts, :owner),
            after_put: Map.get(opts, :after_put),
            delete_error: Map.get(opts, :delete_error)
-         }
+         },
+         features: %{conditional_delete?: true}
        }}
     end
 
@@ -339,6 +350,34 @@ defmodule DurableServerTest do
     end
 
     @impl true
+    def delete_object(%{delete_error: delete_error}, _key, _opts) when not is_nil(delete_error) do
+      {:error, delete_error}
+    end
+
+    def delete_object(%{table: table, owner: owner}, key, opts) do
+      opts = Keyword.validate!(opts, [:etag])
+      record_delete_call(table, key, opts, owner)
+
+      case Keyword.fetch(opts, :etag) do
+        {:ok, expected_etag} ->
+          case :ets.lookup(table, {:data, key}) do
+            [{{:data, ^key}, %{etag: ^expected_etag}}] ->
+              :ets.delete(table, {:data, key})
+              :ok
+
+            [{{:data, ^key}, _value}] ->
+              {:error, :conflict}
+
+            [] ->
+              {:error, :not_found}
+          end
+
+        :error ->
+          delete_object(%{table: table}, key)
+      end
+    end
+
+    @impl true
     def try_claim(%{table: table}, key, body) do
       case :ets.lookup(table, {:data, key}) do
         [] ->
@@ -386,6 +425,15 @@ defmodule DurableServerTest do
 
       if is_pid(owner) do
         send(owner, {:consistency_probe_get, key, opts})
+      end
+    end
+
+    defp record_delete_call(table, key, opts, owner) do
+      call_id = System.unique_integer([:positive, :monotonic])
+      :ets.insert(table, {{:delete_call, call_id}, %{key: key, opts: opts}})
+
+      if is_pid(owner) do
+        send(owner, {:consistency_probe_delete, key, opts})
       end
     end
   end
@@ -3985,6 +4033,77 @@ defmodule DurableServerTest do
       assert atomify_keys(stored_state.state).count == 41
     end
 
+    test "physical delete uses the delete tombstone etag" do
+      {supervisor_name, _supervisor_pid, prefix} =
+        start_test_supervisor(backend: {ConsistencyProbeBackend, owner: self()})
+
+      %{storage_backend: store} = DurableServer.Supervisor.__get_config__(supervisor_name)
+      table = backend_table(store)
+      key = "delete_tombstone_conditional_#{DurableServer.UUID.uuid4()}"
+      storage_key = prefix <> key
+
+      {:ok, {server_pid, _meta}} =
+        DurableServer.Supervisor.start_child(
+          supervisor_name,
+          {TestServer, key: key, initial_state: %{count: 7}}
+        )
+
+      assert :ok =
+               DurableServer.Supervisor.terminate_and_delete_child(supervisor_name, server_pid)
+
+      assert_receive {:consistency_probe_delete, ^storage_key, [etag: tombstone_etag]}, 2_000
+      assert is_binary(tombstone_etag)
+      assert [[etag: ^tombstone_etag]] = recorded_delete_opts(table, storage_key)
+
+      assert {:error, :not_found} =
+               StorageBackend.get_object(store, storage_key, consistent: true)
+    end
+
+    test "stale physical delete cannot remove a replacement after tombstone expiry" do
+      {supervisor_name, _supervisor_pid, prefix} =
+        start_test_supervisor(backend: {ConsistencyProbeBackend, owner: self()})
+
+      %{storage_backend: store} = DurableServer.Supervisor.__get_config__(supervisor_name)
+      table = backend_table(store)
+      key = "delete_tombstone_late_delete_#{DurableServer.UUID.uuid4()}"
+      storage_key = prefix <> key
+
+      deleting_tombstone = %StoredState{
+        vsn: 1,
+        state: %{},
+        meta: %Meta{
+          status: :deleting,
+          pid: nil,
+          supervisor: nil,
+          module: nil,
+          node_ref: nil,
+          node_str: to_string(Node.self()),
+          last_heartbeat_at: System.system_time(:millisecond) - 120_000,
+          crash_history: []
+        }
+      }
+
+      :ets.insert(table, {{:data, storage_key}, %{body: deleting_tombstone, etag: "tombstone"}})
+
+      {:ok, {pid, _meta}} =
+        DurableServer.Supervisor.start_child(
+          supervisor_name,
+          {TestServer, key: key, initial_state: %{count: 41}},
+          timeout: 10_000
+        )
+
+      assert {:error, :conflict} =
+               StorageBackend.delete_object(store, storage_key, etag: "tombstone")
+
+      {:ok, stored_state} =
+        DurableServer.fetch_stored_state(store, %{key: key, prefix: prefix}, consistent: true)
+
+      assert stored_state.meta.status == :running
+      assert stored_state.meta.pid == pid
+      assert atomify_keys(stored_state.state).count == 41
+      refute_process_down(pid)
+    end
+
     test "explicit delete waits while delete tombstone is inside delete request margin" do
       {supervisor_name, _supervisor_pid, prefix} =
         start_test_supervisor(
@@ -4274,6 +4393,65 @@ defmodule DurableServerTest do
                  supervisor_name,
                  non_existent_key
                )
+    end
+
+    test "terminate_and_delete_child/2 with missing key does not issue stale physical delete" do
+      {supervisor_name, _supervisor_pid, prefix} =
+        start_test_supervisor(backend: {ConsistencyProbeBackend, owner: self()})
+
+      %{storage_backend: store} = DurableServer.Supervisor.__get_config__(supervisor_name)
+      table = backend_table(store)
+      key = "delete_missing_no_physical_#{DurableServer.UUID.uuid4()}"
+      storage_key = prefix <> key
+
+      assert :ok = DurableServer.Supervisor.terminate_and_delete_child(supervisor_name, key)
+      assert [] = recorded_delete_opts(table, storage_key)
+    end
+  end
+
+  describe "mirror backend delete semantics" do
+    test "conditional delete support follows write target and does not delete mirror with foreign etag" do
+      primary_table = :ets.new(:mirror_primary_probe, [:set, :public])
+      secondary_table = :ets.new(:mirror_secondary_probe, [:set, :public])
+
+      primary =
+        StorageBackend.new(
+          ConsistencyProbeBackend,
+          %{table: primary_table, owner: self(), after_put: nil, delete_error: nil},
+          %{},
+          %{conditional_delete?: true}
+        )
+
+      secondary =
+        StorageBackend.new(
+          ConsistencyProbeBackend,
+          %{table: secondary_table, owner: self(), after_put: nil, delete_error: nil},
+          %{},
+          %{}
+        )
+
+      {:ok, mirror} =
+        StorageBackend.init_backend(MirrorStore,
+          primary: primary,
+          secondary: secondary,
+          read_preference: :secondary,
+          write_target: :primary,
+          mirror_writes: true,
+          mirror_mode: :required
+        )
+
+      key = "mirror/delete/#{DurableServer.UUID.uuid4()}"
+
+      assert StorageBackend.supports?(mirror, :conditional_delete?)
+      assert {:ok, %{etag: primary_etag}} = StorageBackend.put_object(primary, key, "primary")
+      assert {:ok, _} = StorageBackend.put_object(secondary, key, "secondary")
+
+      assert :ok = StorageBackend.delete_object(mirror, key, etag: primary_etag)
+
+      assert [[etag: ^primary_etag]] = recorded_delete_opts(primary_table, key)
+      assert [] = recorded_delete_opts(secondary_table, key)
+      assert {:error, :not_found} = StorageBackend.get_object(primary, key)
+      assert {:ok, %{body: "secondary"}} = StorageBackend.get_object(secondary, key)
     end
   end
 

@@ -1350,7 +1350,7 @@ defmodule DurableServer do
     case StorageBackend.get_object(store, storage_key, consistent: true) do
       # object already deleted, so we proceed as normal
       {:error, :not_found} ->
-        :ok
+        {:ok, nil}
 
       {:error, reason} ->
         {:error, reason}
@@ -1364,7 +1364,7 @@ defmodule DurableServer do
 
         cond do
           Meta.deleting?(meta) and delete_tombstone_delete_window_open?(meta) ->
-            :ok
+            {:ok, current_etag}
 
           Meta.deleting?(meta) and delete_tombstone_active?(meta) ->
             {:error, {:locked, :deleting}}
@@ -1427,10 +1427,10 @@ defmodule DurableServer do
               )
 
             case result do
-              {:ok, %{etag: _tombstone_etag}} -> :ok
-              {:error, {:deleting, _tombstone_etag}} -> :ok
+              {:ok, %{etag: tombstone_etag}} -> {:ok, tombstone_etag}
+              {:error, {:deleting, tombstone_etag}} -> {:ok, tombstone_etag}
               # object no longer exists, so we proceed as normal
-              {:error, :not_found} -> :ok
+              {:error, :not_found} -> {:ok, nil}
               {:error, {:locked, lock_pid}} -> {:error, {:locked, lock_pid}}
               {:error, reason} -> {:error, reason}
             end
@@ -1476,6 +1476,12 @@ defmodule DurableServer do
     register_pid(%{state | user_meta: new_user_meta})
   end
 
+  defp conditional_delete_opts(%StorageBackend{} = store, etag) when is_binary(etag) do
+    if StorageBackend.supports?(store, :conditional_delete?), do: [etag: etag], else: []
+  end
+
+  defp conditional_delete_opts(%StorageBackend{}, _etag), do: []
+
   @doc false
   def __delete_request__(_supervisor, pid, timeout, _config)
       when is_pid(pid) and is_integer(timeout) do
@@ -1518,16 +1524,29 @@ defmodule DurableServer do
            prefix: prefix,
            supervisor: Map.get(config, :name)
          }) do
+      {:ok, nil} ->
+        Logger.info("Object #{storage_key} already deleted")
+        :ok
+
       # TODO have lifecycle manager handle cleaning up delete locks that failed at this point
-      :ok ->
+      {:ok, tombstone_etag} when is_binary(tombstone_etag) ->
         # successfully acquired lock and marked as :deleting, now delete the object
-        case StorageBackend.delete_object(store, storage_key) do
+        delete_opts = conditional_delete_opts(store, tombstone_etag)
+
+        case StorageBackend.delete_object(store, storage_key, delete_opts) do
           :ok ->
             Logger.info("Successfully deleted #{storage_key} after acquiring delete lock")
             :ok
 
           {:error, :not_found} ->
             Logger.info("Object #{storage_key} already deleted")
+            :ok
+
+          {:error, :conflict} ->
+            Logger.info(
+              "Delete tombstone for #{storage_key} was replaced before physical delete; skipping stale delete"
+            )
+
             :ok
 
           {:error, reason} ->
@@ -2400,20 +2419,48 @@ defmodule DurableServer do
         Logger.info("DurableServer #{state.key} terminating for deletion - removing from storage")
 
         final_status = state.final_status_set || :deleting
-        sync_result = maybe_sync_final_status(state, final_status)
+
+        {sync_result, tombstone_etag} =
+          case maybe_sync_final_status(state, final_status) do
+            {:ok, etag} when is_binary(etag) -> {:ok, etag}
+            other -> {other, nil}
+          end
 
         delete_result =
-          case StorageBackend.delete_object(state.object_store, storage_key(state)) do
+          case sync_result do
             :ok ->
-              Logger.info("Successfully deleted storage for #{state.key}")
-              :ok
+              delete_opts = conditional_delete_opts(state.object_store, tombstone_etag)
 
-            {:error, :not_found} ->
-              Logger.info("Storage already deleted for #{state.key}")
-              :ok
+              case StorageBackend.delete_object(
+                     state.object_store,
+                     storage_key(state),
+                     delete_opts
+                   ) do
+                :ok ->
+                  Logger.info("Successfully deleted storage for #{state.key}")
+                  :ok
+
+                {:error, :not_found} ->
+                  Logger.info("Storage already deleted for #{state.key}")
+                  :ok
+
+                {:error, :conflict} ->
+                  Logger.info(
+                    "Delete tombstone for #{state.key} was replaced before physical delete; skipping stale delete"
+                  )
+
+                  :ok
+
+                {:error, reason} ->
+                  Logger.error("Failed to delete storage for #{state.key}: #{inspect(reason)}")
+                  {:error, reason}
+              end
 
             {:error, reason} ->
-              Logger.error("Failed to delete storage for #{state.key}: #{inspect(reason)}")
+              Logger.error(
+                "Skipping physical delete for #{state.key} because delete tombstone sync failed: #{inspect(reason)}"
+              )
+
               {:error, reason}
           end
 
@@ -2627,7 +2674,7 @@ defmodule DurableServer do
         {:ok, %DurableServer{}} =
           maybe_apply_handle_sync(synced_state, old_user_state, user_state_changed?)
 
-        :ok
+        {:ok, new_state.etag}
 
       {:error, sync_reason} ->
         Logger.error(

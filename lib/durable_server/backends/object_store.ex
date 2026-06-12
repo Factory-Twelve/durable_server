@@ -18,13 +18,24 @@ defmodule DurableServer.Backends.ObjectStore do
          heartbeat_reconcile_interval_ms: 10_000
        },
        features: %{
-         heartbeat_subscribe?: false
+         heartbeat_subscribe?: false,
+         conditional_delete?: conditional_delete_supported?(store)
        }
      }}
   end
 
   def init_backend(opts) when is_list(opts), do: init_backend(ObjectStore.new(opts))
   def init_backend(opts) when is_map(opts), do: opts |> Map.to_list() |> init_backend()
+
+  defp conditional_delete_supported?(%ObjectStore{s3_endpoint: endpoint})
+       when is_binary(endpoint) do
+    case URI.parse(endpoint) do
+      %URI{host: host, port: 4566} when host in ["localhost", "127.0.0.1"] -> false
+      _ -> true
+    end
+  end
+
+  defp conditional_delete_supported?(%ObjectStore{}), do: true
 
   @impl true
   def ensure_ready(%ObjectStore{} = store) do
@@ -62,6 +73,11 @@ defmodule DurableServer.Backends.ObjectStore do
   @impl true
   def delete_object(%ObjectStore{} = store, key) do
     ObjectStore.delete_object(store, key)
+  end
+
+  @impl true
+  def delete_object(%ObjectStore{} = store, key, opts) when is_list(opts) do
+    ObjectStore.delete_object(store, key, opts)
   end
 
   @impl true
