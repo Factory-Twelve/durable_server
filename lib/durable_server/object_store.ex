@@ -34,7 +34,6 @@ defmodule DurableServer.ObjectStore do
             task_supervisor: nil
 
   require Logger
-  require ReqS3
 
   # Import SweetXml for XML parsing and sigils
   import SweetXml
@@ -859,9 +858,6 @@ defmodule DurableServer.ObjectStore do
             {keys, next_token}
 
           {:ok, %{keys: keys, next_continuation_token: nil}} ->
-            {keys, :done}
-
-          {:ok, %{keys: keys}} ->
             {keys, :done}
 
           {:error, reason} ->
