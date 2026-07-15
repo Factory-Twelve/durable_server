@@ -15,6 +15,7 @@ defmodule DurableServer.ObjectStore do
   """
 
   @default_timeout 30_000
+  @max_iam_xml_bytes 1_048_576
 
   @derive {Inspect, only: []}
   defstruct access_key_id: nil,
@@ -361,6 +362,18 @@ defmodule DurableServer.ObjectStore do
     end
   end
 
+  @doc false
+  def __parse_iam_xml__(xml_body)
+      when is_binary(xml_body) and byte_size(xml_body) <= @max_iam_xml_bytes do
+    {:ok, SweetXml.parse(xml_body, dtd: :none, quiet: true)}
+  rescue
+    _error -> {:error, :invalid_xml}
+  catch
+    _kind, _reason -> {:error, :invalid_xml}
+  end
+
+  def __parse_iam_xml__(_xml_body), do: {:error, :invalid_xml}
+
   # Creates an IAM user (for LocalStack only)
   defp create_iam_user(client, user_name) do
     Logger.info("Creating IAM user: #{user_name}")
@@ -405,9 +418,15 @@ defmodule DurableServer.ObjectStore do
           # Parse the XML response manually
           Logger.debug(fn -> "Received CreateAccessKey response: #{inspect(xml_body)}" end)
 
+          xml_document =
+            case __parse_iam_xml__(xml_body) do
+              {:ok, document} -> document
+              {:error, :invalid_xml} -> raise ArgumentError, "invalid IAM XML response"
+            end
+
           # Extract the access key ID and secret from the XML
-          access_key_id = xml_body |> xpath(~x"//AccessKeyId/text()"s)
-          secret_access_key = xml_body |> xpath(~x"//SecretAccessKey/text()"s)
+          access_key_id = xml_document |> xpath(~x"//AccessKeyId/text()"s)
+          secret_access_key = xml_document |> xpath(~x"//SecretAccessKey/text()"s)
 
           if access_key_id != "" and secret_access_key != "" do
             Logger.info("Successfully created access key with ID: #{access_key_id}")
@@ -454,8 +473,14 @@ defmodule DurableServer.ObjectStore do
         )
 
         try do
+          xml_document =
+            case __parse_iam_xml__(xml_body) do
+              {:ok, document} -> document
+              {:error, :invalid_xml} -> raise ArgumentError, "invalid IAM XML response"
+            end
+
           # Extract the policy ARN from the XML
-          policy_arn = xml_body |> xpath(~x"//Arn/text()"s)
+          policy_arn = xml_document |> xpath(~x"//Arn/text()"s)
 
           if policy_arn != "" do
             Logger.info("Successfully created policy with ARN: #{policy_arn}")
@@ -573,20 +598,26 @@ defmodule DurableServer.ObjectStore do
 
     case iam_request(client, params) do
       {:ok, %{body: xml_body}} ->
-        policies =
-          xml_body
-          |> xpath(~x"//Policies/member"l)
-          |> Enum.map(fn policy ->
-            %{
-              arn: xpath(policy, ~x"./Arn/text()"s),
-              name: xpath(policy, ~x"./PolicyName/text()"s)
-            }
-          end)
-          |> Enum.filter(fn policy ->
-            String.contains?(policy.name, policy_prefix)
-          end)
+        case __parse_iam_xml__(xml_body) do
+          {:ok, xml_document} ->
+            policies =
+              xml_document
+              |> xpath(~x"//Policies/member"l)
+              |> Enum.map(fn policy ->
+                %{
+                  arn: xpath(policy, ~x"./Arn/text()"s),
+                  name: xpath(policy, ~x"./PolicyName/text()"s)
+                }
+              end)
+              |> Enum.filter(fn policy ->
+                String.contains?(policy.name, policy_prefix)
+              end)
 
-        {:ok, policies}
+            {:ok, policies}
+
+          {:error, :invalid_xml} ->
+            {:error, {:xml_parse_error, :invalid_xml}}
+        end
 
       {:error, reason} ->
         {:error, reason}
@@ -617,16 +648,18 @@ defmodule DurableServer.ObjectStore do
     }
 
     with {:ok, %{body: policy_xml}} <- iam_request(client, get_policy_params),
-         policy_name = policy_xml |> xpath(~x"//PolicyName/text()"s),
-         default_version = policy_xml |> xpath(~x"//DefaultVersionId/text()"s),
+         {:ok, policy_document} <- __parse_iam_xml__(policy_xml),
+         policy_name = policy_document |> xpath(~x"//PolicyName/text()"s),
+         default_version = policy_document |> xpath(~x"//DefaultVersionId/text()"s),
          get_version_params = %{
            "Action" => "GetPolicyVersion",
            "Version" => "2010-05-08",
            "PolicyArn" => policy_arn,
            "VersionId" => default_version
          },
-         {:ok, %{body: version_xml}} <- iam_request(client, get_version_params) do
-      encoded_document = version_xml |> xpath(~x"//Document/text()"s)
+         {:ok, %{body: version_xml}} <- iam_request(client, get_version_params),
+         {:ok, version_document} <- __parse_iam_xml__(version_xml) do
+      encoded_document = version_document |> xpath(~x"//Document/text()"s)
       document = URI.decode(encoded_document)
 
       {:ok,
