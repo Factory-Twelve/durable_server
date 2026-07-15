@@ -139,6 +139,83 @@ defmodule DurableServer.LifecycleTest do
     def decode(_state, data), do: {:ok, data}
   end
 
+  defmodule DiscoveryCrashOnceBackend do
+    @behaviour DurableServer.StorageBackend
+
+    alias DurableServer.StorageBackend
+
+    @impl true
+    def init_backend(opts) do
+      delegate = Keyword.fetch!(opts, :delegate)
+
+      {:ok,
+       %{
+         state: %{
+           delegate: delegate,
+           table: Keyword.fetch!(opts, :table),
+           notify_pid: Keyword.fetch!(opts, :notify_pid)
+         },
+         defaults: StorageBackend.defaults(delegate),
+         features: StorageBackend.features(delegate)
+       }}
+    end
+
+    @impl true
+    def ensure_ready(%{delegate: delegate}), do: StorageBackend.ensure_ready(delegate)
+
+    @impl true
+    def get_object(%{delegate: delegate}, key, opts),
+      do: StorageBackend.get_object(delegate, key, opts)
+
+    @impl true
+    def list_all_objects_stream(
+          %{delegate: delegate, table: table, notify_pid: notify_pid},
+          prefix,
+          opts
+        ) do
+      if String.ends_with?(prefix, "__nodes/") do
+        StorageBackend.list_all_objects_stream(delegate, prefix, opts)
+      else
+        attempt =
+          :ets.update_counter(
+            table,
+            :discovery_list_attempts,
+            {2, 1},
+            {:discovery_list_attempts, 0}
+          )
+
+        send(notify_pid, {:discovery_list_attempt, attempt})
+
+        if attempt == 1 do
+          raise "injected discovery failure"
+        else
+          StorageBackend.list_all_objects_stream(delegate, prefix, opts)
+        end
+      end
+    end
+
+    @impl true
+    def put_object(%{delegate: delegate}, key, data, opts),
+      do: StorageBackend.put_object(delegate, key, data, opts)
+
+    @impl true
+    def delete_object(%{delegate: delegate}, key), do: StorageBackend.delete_object(delegate, key)
+
+    @impl true
+    def try_claim(%{delegate: delegate}, key, body),
+      do: StorageBackend.try_claim(delegate, key, body)
+
+    @impl true
+    def update_object(%{delegate: delegate}, key, update_fn, opts),
+      do: StorageBackend.update_object(delegate, key, update_fn, opts)
+
+    @impl true
+    def encode(%{delegate: delegate}, data), do: StorageBackend.encode(delegate, data)
+
+    @impl true
+    def decode(%{delegate: delegate}, data), do: StorageBackend.decode(delegate, data)
+  end
+
   defmodule HeartbeatDelayBackend do
     @behaviour DurableServer.StorageBackend
 
@@ -2550,6 +2627,40 @@ defmodule DurableServer.LifecycleTest do
       wait_for_discovery_completion(manager_pid, 100)
 
       assert_process_alive(manager_pid)
+      GenServer.stop(manager_pid)
+    end
+
+    test "an abnormal discovery task exit is handled and retried", %{
+      supervisor_name: supervisor_name,
+      config: config
+    } do
+      table = :ets.new(__MODULE__.DiscoveryCrashOnceBackend, [:set, :public])
+      delegate = DurableServer.Supervisor.__get_config__(supervisor_name).storage_backend
+
+      {:ok, storage_backend} =
+        DurableServer.StorageBackend.init_backend(DiscoveryCrashOnceBackend,
+          delegate: delegate,
+          table: table,
+          notify_pid: self()
+        )
+
+      test_config =
+        config
+        |> Map.put(:object_store, storage_backend)
+        |> Map.put(:storage_backend, storage_backend)
+        |> Map.put(:initial_discovery_delay_ms, 60_000)
+        |> Map.put(:discovery_interval_ms, 10)
+
+      {:ok, manager_pid} = start_standalone_lifecycle_manager(supervisor_name, test_config)
+      manager_ref = Process.monitor(manager_pid)
+
+      send(manager_pid, :discover_and_restart)
+
+      assert_receive {:discovery_list_attempt, 1}, 1_000
+      assert_receive {:discovery_list_attempt, 2}, 1_000
+      refute_receive {:DOWN, ^manager_ref, :process, ^manager_pid, _reason}, 50
+      assert Process.alive?(manager_pid)
+
       GenServer.stop(manager_pid)
     end
 

@@ -594,7 +594,7 @@ defmodule DurableServer.LifecycleManager do
     end
 
     task =
-      Task.Supervisor.async(state.task_sup, fn ->
+      Task.Supervisor.async_nolink(state.task_sup, fn ->
         {:discover, discover_and_restart_servers(state)}
       end)
 
