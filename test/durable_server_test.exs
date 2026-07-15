@@ -107,6 +107,10 @@ defmodule DurableServerTest do
     :ets.insert(table, {{:override, key, consistent}, response})
   end
 
+  defp put_backend_delete_override(table, key, response) do
+    :ets.insert(table, {{:delete_override, key}, response})
+  end
+
   defp insert_running_lock(table, storage_key, supervisor_name, prefix, key, pid) do
     node_ref = DurableServer.Supervisor.node_ref(supervisor_name)
 
@@ -323,13 +327,19 @@ defmodule DurableServerTest do
 
     @impl true
     def delete_object(%{table: table}, key) do
-      case :ets.lookup(table, {:data, key}) do
-        [{{:data, ^key}, _value}] ->
-          :ets.delete(table, {:data, key})
-          :ok
+      case :ets.lookup(table, {:delete_override, key}) do
+        [{{:delete_override, ^key}, response}] ->
+          response
 
         [] ->
-          {:error, :not_found}
+          case :ets.lookup(table, {:data, key}) do
+            [{{:data, ^key}, _value}] ->
+              :ets.delete(table, {:data, key})
+              :ok
+
+            [] ->
+              {:error, :not_found}
+          end
       end
     end
 
@@ -3556,6 +3566,35 @@ defmodule DurableServerTest do
       assert final_state.meta.pid == self()
       assert final_state.meta.node_ref == newer_owner.node_ref
       assert final_state.meta.status == :running
+    end
+
+    test "terminate_and_delete_child returns a storage deletion failure", %{prefix: _prefix} do
+      {supervisor_name, _supervisor_pid, prefix} =
+        start_test_supervisor(backend: {ConsistencyProbeBackend, owner: self()})
+
+      %{storage_backend: backend} = DurableServer.Supervisor.__get_config__(supervisor_name)
+
+      for target <- [:pid, :key] do
+        key = "delete-failure-#{target}-#{DurableServer.UUID.uuid4()}"
+
+        {:ok, {server_pid, _meta}} =
+          DurableServer.Supervisor.start_child(
+            supervisor_name,
+            {DeleteTestServer, key: key, initial_state: %{}}
+          )
+
+        storage_key = prefix <> key
+        put_backend_delete_override(backend_table(backend), storage_key, {:error, :unavailable})
+        delete_target = if target == :pid, do: server_pid, else: key
+
+        assert {:error, :unavailable} =
+                 DurableServer.Supervisor.terminate_and_delete_child(
+                   supervisor_name,
+                   delete_target
+                 )
+
+        assert {:ok, _object} = StorageBackend.get_object(backend, storage_key)
+      end
     end
 
     test "terminate_and_delete_child/2 with key deletes running process and storage", %{

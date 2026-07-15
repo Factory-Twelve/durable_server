@@ -817,6 +817,8 @@ defmodule DurableServer do
             permanent: false,
             was_permanently_crashed: false,
             user_initiated_stop: nil,
+            delete_request_ref: nil,
+            delete_requester_pid: nil,
             start_time: nil,
             restart_attempt_node: nil,
             restart_attempt_time: nil,
@@ -1376,6 +1378,9 @@ defmodule DurableServer do
 
           {:error, :timeout} ->
             delete_with_lock_attempt(key, timeout, config)
+
+          {:error, _reason} = error ->
+            error
         end
 
       nil ->
@@ -1426,30 +1431,49 @@ defmodule DurableServer do
   end
 
   defp delete_by_pid(pid, timeout) when is_pid(pid) and is_integer(timeout) do
-    start_time = System.system_time(:millisecond)
+    deadline = System.monotonic_time(:millisecond) + timeout
     ref = make_ref()
     monitor_ref = Process.monitor(pid)
     send(pid, {@durable, {:delete_request, ref, self()}})
 
-    receive do
-      # process is shutting down and attempting to delete itself
-      {:delete_in_progress, ^ref} ->
-        Logger.info("Process #{inspect(pid)} completed self-deletion")
-        remaining_timeout = timeout - (System.system_time(:millisecond) - start_time)
+    try do
+      receive do
+        {:delete_in_progress, ^ref} ->
+          await_delete_completion(pid, ref, monitor_ref, deadline)
 
-        # await shutdown
+        # process is dead and did not process our delete request
+        {:DOWN, ^monitor_ref, :process, ^pid, _reason} ->
+          {:error, :noproc}
+      after
+        remaining_delete_timeout(deadline) -> {:error, :timeout}
+      end
+    after
+      Process.demonitor(monitor_ref, [:flush])
+    end
+  end
+
+  defp await_delete_completion(pid, ref, monitor_ref, deadline) do
+    receive do
+      {:delete_complete, ^ref, result} ->
         receive do
-          {:DOWN, ^monitor_ref, :process, ^pid, _} -> :ok
+          {:DOWN, ^monitor_ref, :process, ^pid, _reason} -> result
         after
-          remaining_timeout -> {:error, :timeout}
+          remaining_delete_timeout(deadline) -> {:error, :timeout}
         end
 
-      # process is dead and did not process our delete request
-      {:DOWN, ^monitor_ref, :process, ^pid, _} ->
-        {:error, :noproc}
+      {:DOWN, ^monitor_ref, :process, ^pid, reason} ->
+        receive do
+          {:delete_complete, ^ref, result} -> result
+        after
+          0 -> {:error, {:delete_not_completed, reason}}
+        end
     after
-      timeout -> {:error, :timeout}
+      remaining_delete_timeout(deadline) -> {:error, :timeout}
     end
+  end
+
+  defp remaining_delete_timeout(deadline) do
+    max(deadline - System.monotonic_time(:millisecond), 0)
   end
 
   @doc false
@@ -1687,7 +1711,13 @@ defmodule DurableServer do
 
     # Defer status persistence to terminate/2 after user callback terminate/2 has run.
     updated_state =
-      %{state | user_initiated_stop: {:shutdown, :delete}, final_status_set: :deleting}
+      %{
+        state
+        | user_initiated_stop: {:shutdown, :delete},
+          final_status_set: :deleting,
+          delete_request_ref: ref,
+          delete_requester_pid: requester_pid
+      }
 
     # stop with delete reason to trigger deletion in terminate/2
     {:stop, {:shutdown, :delete}, updated_state}
@@ -1736,8 +1766,20 @@ defmodule DurableServer do
           handle_user_initiated_terminate(user_stop, reason, state)
       end
 
+    notify_delete_result(state, sync_result)
     maybe_invoke_after_terminate(state, terminate_return, reason, final_status, sync_result)
   end
+
+  defp notify_delete_result(
+         %DurableServer{delete_request_ref: ref, delete_requester_pid: requester_pid},
+         result
+       )
+       when is_reference(ref) and is_pid(requester_pid) do
+    send(requester_pid, {:delete_complete, ref, result})
+    :ok
+  end
+
+  defp notify_delete_result(%DurableServer{}, _result), do: :ok
 
   defp bootstrap_init(
          %DurableServer{
