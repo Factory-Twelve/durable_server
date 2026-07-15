@@ -1654,9 +1654,7 @@ defmodule DurableServer do
         {:noreply, schedule_sync(new_state)}
 
       {:error, :conflict} ->
-        fatal_exit!(
-          "#{state.key} object updated out from underneath: #{inspect(node: node(), pid: self())}"
-        )
+        fatal_sync_conflict!(state)
 
       {:error, reason} ->
         # continue without stopping for transient errors (ie timeouts), but log the error
@@ -2604,9 +2602,7 @@ defmodule DurableServer do
         synced_state
 
       {:error, :conflict} ->
-        fatal_exit!(
-          "#{state.key} object updated out from underneath: #{inspect(node: node(), pid: self())}"
-        )
+        fatal_sync_conflict!(state)
 
       {:error, reason} ->
         if is_map(metadata) do
@@ -2639,6 +2635,9 @@ defmodule DurableServer do
         {:ok, %DurableServer{} = new_state} ->
           new_state
 
+        {:error, :conflict} ->
+          fatal_sync_conflict!(state)
+
         {:error, reason} ->
           Logger.error(fn ->
             "#{inspect(module)} (key=#{key}) unable to auto_sync: #{inspect(reason)}"
@@ -2649,6 +2648,12 @@ defmodule DurableServer do
     else
       state
     end
+  end
+
+  defp fatal_sync_conflict!(%DurableServer{} = state) do
+    fatal_exit!(
+      "#{state.key} object updated out from underneath: #{inspect(node: node(), pid: self())}"
+    )
   end
 
   defp sync_to_storage(%DurableServer{} = state, opts \\ []) do

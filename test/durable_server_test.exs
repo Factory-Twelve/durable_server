@@ -1686,6 +1686,30 @@ defmodule DurableServerTest do
              } = persisted_data
     end
 
+    test "stops when auto sync loses the storage CAS", %{prefix: _prefix} do
+      {supervisor_name, _supervisor_pid, prefix} =
+        start_test_supervisor(backend: {ConsistencyProbeBackend, owner: self()})
+
+      key = "auto-sync-conflict-#{DurableServer.UUID.uuid4()}"
+
+      {:ok, {pid, _meta}} =
+        DurableServer.Supervisor.start_child(
+          supervisor_name,
+          {AutoSyncServer, key: key, initial_state: %{}}
+        )
+
+      %{storage_backend: backend} = DurableServer.Supervisor.__get_config__(supervisor_name)
+      storage_key = prefix <> key
+      {:ok, %{body: stored_state, etag: etag}} = StorageBackend.get_object(backend, storage_key)
+
+      assert {:ok, _obj} =
+               StorageBackend.put_object(backend, storage_key, stored_state, etag: etag)
+
+      ref = Process.monitor(pid)
+      assert catch_exit(GenServer.call(pid, :increment))
+      assert_receive {:DOWN, ^ref, :process, ^pid, _reason}
+    end
+
     test "does not auto sync when disabled", %{supervisor_name: supervisor_name, prefix: prefix} do
       key = "no-auto-sync-test-#{DurableServer.UUID.uuid4()}"
 
