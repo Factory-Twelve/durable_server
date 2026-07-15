@@ -597,7 +597,7 @@ defmodule DurableServer.Supervisor do
         # add total capacity if configured
         capacity_map =
           if total_limit = max_children[:total] do
-            current = Group.local_registry_count(supervisor_name)
+            current = capacity_count(table_name, :capacity_count_total)
             Map.put(capacity_map, :total, %{current: current, limit: total_limit})
           else
             capacity_map
@@ -609,10 +609,7 @@ defmodule DurableServer.Supervisor do
           |> Enum.reject(fn {k, _v} -> k == :total end)
           |> Enum.reduce(capacity_map, fn {module, limit}, acc ->
             current =
-              Group.local_member_count(
-                supervisor_name,
-                __module_group_prefix__(module)
-              )
+              capacity_count(table_name, {:capacity_count_module, module})
 
             Map.put(acc, module, %{current: current, limit: limit})
           end)
@@ -621,6 +618,13 @@ defmodule DurableServer.Supervisor do
     end
   rescue
     _ -> nil
+  end
+
+  defp capacity_count(table_name, key) do
+    case :ets.lookup(table_name, key) do
+      [{^key, count}] -> count
+      [] -> 0
+    end
   end
 
   @doc """
@@ -1122,27 +1126,36 @@ defmodule DurableServer.Supervisor do
          reply_to
        ) do
     # Reject before spawning a local child when this node is draining.
-    case check_local_start_capacity(supervisor, module, boot_info) do
-      :ok ->
-        do_start_child_inner(
-          supervisor,
-          module,
-          init_arg,
-          boot_info,
-          key,
-          retries,
-          deadline_ms,
-          reply_to
-        )
+    case reserve_local_start_capacity(supervisor, module, boot_info) do
+      {:ok, capacity_reservation} ->
+        try do
+          do_start_child_inner(
+            supervisor,
+            module,
+            init_arg,
+            boot_info,
+            key,
+            retries,
+            deadline_ms,
+            reply_to,
+            capacity_reservation
+          )
+        after
+          LifecycleManager.cancel_capacity_reservation(capacity_reservation)
+        end
 
       {:error, {:capacity_limit, _reason}} = error ->
         error
     end
   end
 
-  defp check_local_start_capacity(supervisor, module, boot_info) do
-    case LifecycleManager.check_capacity(supervisor, module, local_start_capacity_opts(boot_info)) do
-      :ok -> :ok
+  defp reserve_local_start_capacity(supervisor, module, boot_info) do
+    case LifecycleManager.reserve_capacity(
+           supervisor,
+           module,
+           local_start_capacity_opts(boot_info)
+         ) do
+      {:ok, reservation} -> {:ok, reservation}
       {:error, {:limit_reached, reason, _details}} -> {:error, {:capacity_limit, reason}}
     end
   end
@@ -1163,7 +1176,8 @@ defmodule DurableServer.Supervisor do
          key,
          retries,
          deadline_ms,
-         reply_to
+         reply_to,
+         capacity_reservation
        ) do
     dynamic_sup = get_dynamic_supervisor(supervisor)
     config = __get_config__(supervisor)
@@ -1186,6 +1200,7 @@ defmodule DurableServer.Supervisor do
 
     case DynamicSupervisor.start_child(dynamic_sup, child_spec) do
       {:ok, pid} ->
+        LifecycleManager.commit_capacity_reservation(capacity_reservation, pid)
         monitor_ref = Process.monitor(pid)
         timeout_ms = remaining_timeout_ms(deadline_ms)
 
@@ -1359,6 +1374,9 @@ defmodule DurableServer.Supervisor do
               {:error, :timeout}
           end
         end
+
+      {:error, :max_children} ->
+        {:error, {:capacity_limit, :max_children_total}}
 
       {:error, reason} ->
         {:error, reason}
@@ -3472,6 +3490,7 @@ defmodule DurableServer.Supervisor do
 
     :ets.insert(table_name, {:config, config})
     :ets.insert(table_name, {:capacity_limits, capacity_limits})
+    :ets.insert(table_name, {:capacity_count_total, 0})
     :ets.insert(table_name, {:sticky_placement_config, sticky_placement_config})
 
     :ets.insert(
@@ -3926,8 +3945,11 @@ defmodule DurableServer.Supervisor do
       :infinity ->
         limits
 
+      limit when is_integer(limit) and limit > 0 ->
+        Map.put(limits, :max_children, %{total: limit})
+
       limit when is_integer(limit) ->
-        %{:total => limit}
+        raise ArgumentError, "max_children must be a positive integer, got: #{inspect(limit)}"
 
       limit_map when is_map(limit_map) ->
         validate_max_children_map!(limit_map)

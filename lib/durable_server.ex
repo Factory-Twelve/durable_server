@@ -1808,7 +1808,12 @@ defmodule DurableServer do
          }
        ) do
     with :ok <- maybe_check_global_lock_circuit_breaker(circuit_breaker, preloaded_boot),
-         :ok <- LifecycleManager.check_capacity(supervisor_name, module, capacity_opts) do
+         :ok <-
+           LifecycleManager.check_capacity(
+             supervisor_name,
+             module,
+             Keyword.put(capacity_opts, :skip_count_limits, true)
+           ) do
       current_node_str = to_string(Node.self())
 
       load_result =

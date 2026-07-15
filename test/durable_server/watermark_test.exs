@@ -3,6 +3,22 @@ defmodule DurableServer.WatermarkTest do
   import DurableServer.TestHelper
   alias DurableServer
 
+  defmodule SlowInitWatermarkTestServer do
+    use DurableServer, vsn: 1
+
+    @impl true
+    def init(state, _info) do
+      Process.sleep(Map.fetch!(state, "init_delay_ms"))
+      {:ok, state}
+    end
+
+    @impl true
+    def dump_state(state), do: state
+
+    @impl true
+    def load_state(_vsn, state), do: state
+  end
+
   defmodule WatermarkTestServer do
     use DurableServer, vsn: 1
 
@@ -195,6 +211,43 @@ defmodule DurableServer.WatermarkTest do
                  supervisor_name,
                  {WatermarkTestServer, key: "key3", initial_state: %{}}
                )
+    end
+
+    test "enforces a map limit atomically across concurrent starts", %{
+      supervisor_name: supervisor_name,
+      prefix: prefix
+    } do
+      start_supervised!(
+        {DurableServer.Supervisor,
+         name: supervisor_name,
+         prefix: prefix,
+         object_store: test_object_store_opts(),
+         max_children: %{SlowInitWatermarkTestServer => 1}}
+      )
+
+      results =
+        1..12
+        |> Task.async_stream(
+          fn index ->
+            DurableServer.Supervisor.start_child(
+              supervisor_name,
+              {SlowInitWatermarkTestServer,
+               key: "concurrent-#{index}", initial_state: %{init_delay_ms: 300}},
+              max_placement_retries: 0
+            )
+          end,
+          max_concurrency: 12,
+          timeout: 5_000
+        )
+        |> Enum.map(fn {:ok, result} -> result end)
+
+      assert Enum.count(results, &match?({:ok, _}, &1)) == 1
+
+      assert Enum.all?(results, fn
+               {:ok, _} -> true
+               {:error, {:capacity_limit, :max_children_module}} -> true
+               _ -> false
+             end)
     end
   end
 
@@ -428,18 +481,30 @@ defmodule DurableServer.WatermarkTest do
                )
     end
 
-    test "accepts integer max_children for DynamicSupervisor (legacy)", %{
+    test "enforces integer max_children with normalized errors", %{
       supervisor_name: supervisor_name,
       prefix: prefix
     } do
-      # Integer max_children should be accepted but not used for capacity limiting
       assert {:ok, _pid} =
                start_supervised(
                  {DurableServer.Supervisor,
                   name: supervisor_name,
                   prefix: prefix,
                   object_store: test_object_store_opts(),
-                  max_children: 100}
+                  max_children: 1}
+               )
+
+      assert {:ok, {_pid, _meta}} =
+               DurableServer.Supervisor.start_child(
+                 supervisor_name,
+                 {WatermarkTestServer, key: "integer-1", initial_state: %{}}
+               )
+
+      assert {:error, {:capacity_limit, :max_children_total}} =
+               DurableServer.Supervisor.start_child(
+                 supervisor_name,
+                 {WatermarkTestServer, key: "integer-2", initial_state: %{}},
+                 max_placement_retries: 0
                )
     end
   end

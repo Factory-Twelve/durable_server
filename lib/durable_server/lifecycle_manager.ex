@@ -2723,13 +2723,51 @@ defmodule DurableServer.LifecycleManager do
       the local disk, so rejecting based on disk usage would be counterproductive.
   """
   def check_capacity(supervisor_name, module, opts \\ []) do
-    opts = Keyword.validate!(opts, [:bypass_disk_check])
+    opts = Keyword.validate!(opts, [:bypass_disk_check, :skip_count_limits])
+
+    count_result =
+      if Keyword.get(opts, :skip_count_limits, false) do
+        :ok
+      else
+        check_count_limits(supervisor_name, module)
+      end
 
     with :ok <- check_shutting_down(supervisor_name),
-         :ok <- check_count_limits(supervisor_name, module),
-         :ok <- check_resource_limits(supervisor_name, opts) do
+         :ok <- count_result,
+         :ok <- check_resource_limits(supervisor_name, Keyword.take(opts, [:bypass_disk_check])) do
       :ok
     end
+  end
+
+  @doc false
+  def reserve_capacity(supervisor_name, module, opts \\ []) do
+    opts = Keyword.validate!(opts, [:bypass_disk_check])
+
+    %{ets_table: table_name} =
+      DurableServer.Supervisor.__get_config__(supervisor_name)
+
+    with :ok <- check_shutting_down(supervisor_name),
+         :ok <- check_resource_limits(supervisor_name, opts),
+         {:ok, counter_keys} <- reserve_count_slots(table_name, module) do
+      {:ok, start_capacity_reservation_keeper(table_name, counter_keys, self())}
+    end
+  end
+
+  @doc false
+  def commit_capacity_reservation(nil, _pid), do: :ok
+
+  def commit_capacity_reservation(reservation, pid)
+      when is_pid(reservation) and is_pid(pid) do
+    send(reservation, {:commit, pid})
+    :ok
+  end
+
+  @doc false
+  def cancel_capacity_reservation(nil), do: :ok
+
+  def cancel_capacity_reservation(reservation) when is_pid(reservation) do
+    send(reservation, :cancel)
+    :ok
   end
 
   defp check_shutting_down(supervisor_name) do
@@ -2753,13 +2791,8 @@ defmodule DurableServer.LifecycleManager do
         :ok
 
       max_children_limits ->
-        global_count = Group.local_registry_count(supervisor_name)
-
-        module_count =
-          Group.local_member_count(
-            supervisor_name,
-            DurableServer.Supervisor.__module_group_prefix__(module)
-          )
+        global_count = capacity_counter(table_name, :capacity_count_total)
+        module_count = capacity_counter(table_name, capacity_module_counter_key(module))
 
         total_limit = max_children_limits[:total]
         module_limit = max_children_limits[module]
@@ -2779,6 +2812,96 @@ defmodule DurableServer.LifecycleManager do
         end
     end
   end
+
+  defp reserve_count_slots(table_name, module) do
+    [{:capacity_limits, limits}] = :ets.lookup(table_name, :capacity_limits)
+    max_children_limits = Map.get(limits, :max_children, %{})
+    total_limit = max_children_limits[:total]
+    module_limit = max_children_limits[module]
+
+    case reserve_capacity_counter(
+           table_name,
+           :capacity_count_total,
+           total_limit,
+           :max_children_total,
+           %{limit: total_limit}
+         ) do
+      {:ok, total_keys} ->
+        case reserve_capacity_counter(
+               table_name,
+               capacity_module_counter_key(module),
+               module_limit,
+               :max_children_module,
+               %{module: module, limit: module_limit}
+             ) do
+          {:ok, module_keys} ->
+            {:ok, total_keys ++ module_keys}
+
+          {:error, reason} ->
+            release_capacity_counters(table_name, total_keys)
+            {:error, reason}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp reserve_capacity_counter(_table_name, _key, nil, _reason, _details), do: {:ok, []}
+
+  defp reserve_capacity_counter(table_name, key, limit, reason, details) do
+    current = :ets.update_counter(table_name, key, {2, 1}, {key, 0})
+
+    if current <= limit do
+      {:ok, [key]}
+    else
+      :ets.update_counter(table_name, key, {2, -1})
+
+      {:error, {:limit_reached, reason, Map.put(details, :current, current - 1)}}
+    end
+  end
+
+  defp start_capacity_reservation_keeper(_table_name, [], _owner), do: nil
+
+  defp start_capacity_reservation_keeper(table_name, counter_keys, owner) do
+    spawn(fn ->
+      owner_ref = Process.monitor(owner)
+
+      receive do
+        {:commit, child_pid} when is_pid(child_pid) ->
+          Process.demonitor(owner_ref, [:flush])
+          child_ref = Process.monitor(child_pid)
+
+          receive do
+            {:DOWN, ^child_ref, :process, ^child_pid, _reason} ->
+              release_capacity_counters(table_name, counter_keys)
+          end
+
+        :cancel ->
+          Process.demonitor(owner_ref, [:flush])
+          release_capacity_counters(table_name, counter_keys)
+
+        {:DOWN, ^owner_ref, :process, ^owner, _reason} ->
+          release_capacity_counters(table_name, counter_keys)
+      end
+    end)
+  end
+
+  defp release_capacity_counters(table_name, counter_keys) do
+    Enum.each(counter_keys, &:ets.update_counter(table_name, &1, {2, -1}))
+    :ok
+  rescue
+    ArgumentError -> :ok
+  end
+
+  defp capacity_counter(table_name, key) do
+    case :ets.lookup(table_name, key) do
+      [{^key, count}] -> count
+      [] -> 0
+    end
+  end
+
+  defp capacity_module_counter_key(module), do: {:capacity_count_module, module}
 
   defp check_resource_limits(supervisor_name, opts) do
     opts = Keyword.validate!(opts, [:bypass_disk_check])
