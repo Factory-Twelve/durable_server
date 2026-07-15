@@ -1591,20 +1591,11 @@ defmodule DurableServer.LifecycleTest do
       # Manager should still be alive despite corrupted data
       assert_process_alive(manager_pid)
 
-      # Should have attempted to process or clean up corruption
-      {:ok, data} =
-        DurableServer.fetch_stored_state(config.object_store, %{key: key, prefix: prefix})
+      # Corrupt typed fields are rejected as data errors rather than admitted into Meta.
+      assert {:error, %ArgumentError{message: message}} =
+               DurableServer.fetch_stored_state(config.object_store, %{key: key, prefix: prefix})
 
-      # The restart attempt fields should be handled gracefully
-      # Since we started with corrupted string values, they might remain as strings
-      # or be cleaned up entirely. Both are acceptable for corruption recovery.
-      restart_time = Map.get(data.meta, :restart_attempt_time)
-
-      if restart_time do
-        # Either cleaned up and replaced with proper integer, or left as original corrupt string
-        assert is_integer(restart_time) or is_binary(restart_time),
-               "Restart time should be integer (if fixed) or string (if original corrupt data)"
-      end
+      assert message =~ "invalid metadata field :restart_attempt_time"
 
       GenServer.stop(manager_pid)
     end
