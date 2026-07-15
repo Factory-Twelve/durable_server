@@ -107,6 +107,10 @@ defmodule DurableServerTest do
     :ets.insert(table, {{:override, key, consistent}, response})
   end
 
+  defp put_backend_write_override(table, key, response) do
+    :ets.insert(table, {{:put_override, key}, response})
+  end
+
   defp insert_running_lock(table, storage_key, supervisor_name, prefix, key, pid) do
     node_ref = DurableServer.Supervisor.node_ref(supervisor_name)
 
@@ -300,21 +304,27 @@ defmodule DurableServerTest do
     @impl true
     def put_object(%{table: table} = state, key, data, opts) do
       result =
-        case Keyword.fetch(opts, :etag) do
-          {:ok, expected_etag} ->
-            case :ets.lookup(table, {:data, key}) do
-              [{{:data, ^key}, %{etag: ^expected_etag}}] ->
+        case :ets.lookup(table, {:put_override, key}) do
+          [{{:put_override, ^key}, response}] ->
+            response
+
+          [] ->
+            case Keyword.fetch(opts, :etag) do
+              {:ok, expected_etag} ->
+                case :ets.lookup(table, {:data, key}) do
+                  [{{:data, ^key}, %{etag: ^expected_etag}}] ->
+                    store_value(table, key, data)
+
+                  [{{:data, ^key}, _value}] ->
+                    {:error, :conflict}
+
+                  [] ->
+                    {:error, :not_found}
+                end
+
+              :error ->
                 store_value(table, key, data)
-
-              [{{:data, ^key}, _value}] ->
-                {:error, :conflict}
-
-              [] ->
-                {:error, :not_found}
             end
-
-          :error ->
-            store_value(table, key, data)
         end
 
       maybe_after_put(state, key, data, opts, result)
@@ -2113,11 +2123,13 @@ defmodule DurableServerTest do
   end
 
   describe "error handling" do
-    test "continues operation when sync operations encounter errors", %{
-      supervisor_name: supervisor_name,
+    test "explicit sync does not acknowledge a mutation when persistence fails", %{
       prefix: _prefix
     } do
-      key = "test-server-#{DurableServer.UUID.uuid4()}"
+      {supervisor_name, _supervisor_pid, prefix} =
+        start_test_supervisor(backend: {ConsistencyProbeBackend, owner: self()})
+
+      key = "explicit-sync-failure-#{DurableServer.UUID.uuid4()}"
 
       {:ok, {pid, _meta}} =
         DurableServer.Supervisor.start_child(
@@ -2125,10 +2137,18 @@ defmodule DurableServerTest do
           {TestServer, key: key, initial_state: %{}}
         )
 
-      # Basic operations should work
-      assert GenServer.call(pid, :increment) == 1
-      assert GenServer.call(pid, :increment_and_sync) == 2
-      assert GenServer.call(pid, :get_count) == 2
+      %{storage_backend: backend} = DurableServer.Supervisor.__get_config__(supervisor_name)
+      put_backend_write_override(backend_table(backend), prefix <> key, {:error, :unavailable})
+
+      result =
+        try do
+          {:reply, GenServer.call(pid, :increment_and_sync)}
+        catch
+          :exit, reason -> {:exit, reason}
+        end
+
+      refute match?({:reply, _reply}, result),
+             "explicit :sync returned success even though persistence failed"
     end
 
     test "auto-sync servers continue operating", %{
