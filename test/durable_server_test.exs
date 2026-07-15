@@ -510,6 +510,11 @@ defmodule DurableServerTest do
       {:noreply, new_state}
     end
 
+    def handle_cast(:increment_with_timeout, %{count: count} = state) do
+      new_state = %{state | count: count + 1}
+      {:noreply, new_state, 1_000}
+    end
+
     def handle_cast(:increment_and_sync, %{count: count} = state) do
       new_state = %{state | count: count + 1}
       {:noreply, new_state, :sync}
@@ -1384,6 +1389,14 @@ defmodule DurableServerTest do
       assert GenServer.call(pid, :get_count) == 0
       assert GenServer.call(pid, :increment) == 1
       assert GenServer.call(pid, :get_count) == 1
+    end
+
+    test "supports integer timeout actions from call and noreply callbacks", %{pid: pid} do
+      assert GenServer.call(pid, :increment_with_timeout) == 1
+      GenServer.cast(pid, :increment_with_timeout)
+      :sys.get_state(pid)
+      assert GenServer.call(pid, :get_count) == 2
+      refute_process_down(pid)
     end
 
     test "handles cast messages", %{pid: pid} do
@@ -3516,6 +3529,10 @@ defmodule DurableServerTest do
       {:stop, {:shutdown, :permanent}, :ok, state}
     end
 
+    def handle_call(:stop_shutdown_normal, _from, state) do
+      {:stop, {:shutdown, :normal}, :ok, state}
+    end
+
     def handle_call(:stop_permanent_non_shutdown, _from, state) do
       {:stop, :permanent, :ok, state}
     end
@@ -3954,6 +3971,31 @@ defmodule DurableServerTest do
 
       # verify EXIT signal was :normal (which doesn't kill non-trapping processes)
       assert_receive {:EXIT, ^server_pid, :normal}, 100
+    end
+
+    test "{:stop, {:shutdown, :normal}, state} stops gracefully with the wrapped reason", %{
+      supervisor_name: supervisor_name,
+      prefix: prefix
+    } do
+      key = "normal_shutdown_#{DurableServer.UUID.uuid4()}"
+
+      {:ok, {server_pid, _meta}} =
+        DurableServer.Supervisor.start_child(
+          supervisor_name,
+          {DeleteTestServer, key: key, initial_state: %{}}
+        )
+
+      ref = Process.monitor(server_pid)
+      assert :ok = GenServer.call(server_pid, :stop_shutdown_normal)
+      assert_receive {:DOWN, ^ref, :process, ^server_pid, {:shutdown, :normal}}
+
+      assert {:ok, stored_state} =
+               DurableServer.fetch_stored_state(
+                 DurableServer.Supervisor.__get_config__(supervisor_name).storage_backend,
+                 %{key: key, prefix: prefix}
+               )
+
+      assert stored_state.meta.status == :stopped_graceful
     end
 
     test "{:stop, {:shutdown, :permanent}, state} stops with permanent status and propagates exit",

@@ -841,6 +841,10 @@ defmodule DurableServer do
   @max_sync_retries 5
   @bootstrap_continue {@durable, :bootstrap}
 
+  defguardp is_callback_action(action)
+            when is_atom(action) or is_tuple(action) or
+                   (is_integer(action) and action >= 0)
+
   defmacro __using__(opts) do
     vsn =
       case Keyword.fetch(opts, :vsn) do
@@ -2375,7 +2379,7 @@ defmodule DurableServer do
 
       # Handle action + options tuple.
       {:reply, reply, new_user_state, action, opts}
-      when (is_atom(action) or is_tuple(action)) and is_list(opts) ->
+      when is_callback_action(action) and is_list(opts) ->
         {updated_state, sync?} = apply_callback_options(state, opts)
 
         {final_state, final_action} = handle_action(updated_state, new_user_state, action)
@@ -2397,7 +2401,7 @@ defmodule DurableServer do
 
         {:reply, reply, new_state}
 
-      {:reply, reply, new_user_state, action} when is_atom(action) or is_tuple(action) ->
+      {:reply, reply, new_user_state, action} when is_callback_action(action) ->
         {final_state, final_action} = handle_action(state, new_user_state, action)
 
         if final_action do
@@ -2413,7 +2417,7 @@ defmodule DurableServer do
          |> auto_sync_to_storage()}
 
       {:noreply, new_user_state, action, opts}
-      when (is_atom(action) or is_tuple(action)) and is_list(opts) ->
+      when is_callback_action(action) and is_list(opts) ->
         {updated_state, sync?} = apply_callback_options(state, opts)
 
         {final_state, final_action} = handle_action(updated_state, new_user_state, action)
@@ -2435,7 +2439,7 @@ defmodule DurableServer do
 
         {:noreply, new_state}
 
-      {:noreply, new_user_state, action} when is_atom(action) or is_tuple(action) ->
+      {:noreply, new_user_state, action} when is_callback_action(action) ->
         {final_state, final_action} = handle_action(state, new_user_state, action)
 
         if final_action do
@@ -2483,6 +2487,32 @@ defmodule DurableServer do
           )
 
         {:stop, :normal, stopped_state}
+
+      {:stop, {:shutdown, :normal}, reply, new_user_state} ->
+        stopped_state =
+          update_state(
+            %{
+              state
+              | user_initiated_stop: {:shutdown, :normal},
+                final_status_set: :stopped_graceful
+            },
+            new_user_state
+          )
+
+        {:stop, {:shutdown, :normal}, reply, stopped_state}
+
+      {:stop, {:shutdown, :normal}, new_user_state} ->
+        stopped_state =
+          update_state(
+            %{
+              state
+              | user_initiated_stop: {:shutdown, :normal},
+                final_status_set: :stopped_graceful
+            },
+            new_user_state
+          )
+
+        {:stop, {:shutdown, :normal}, stopped_state}
 
       {:stop, {:shutdown, :permanent}, reply, new_user_state} ->
         # shutdown-wrapped permanent stop
