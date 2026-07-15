@@ -1941,18 +1941,30 @@ defmodule DurableServer do
         Logger.info("DurableServer #{state.key} terminating for deletion - removing from storage")
 
         final_status = state.final_status_set || :deleting
-        sync_result = maybe_sync_final_status(state, final_status)
 
-        case StorageBackend.delete_object(state.object_store, storage_key(state)) do
-          :ok ->
-            Logger.info("Successfully deleted storage for #{state.key}")
+        sync_result =
+          case persist_final_status(state, final_status) do
+            {:ok, %DurableServer{} = synced_state} ->
+              case StorageBackend.delete_object(
+                     synced_state.object_store,
+                     storage_key(synced_state)
+                   ) do
+                :ok ->
+                  Logger.info("Successfully deleted storage for #{state.key}")
+                  :ok
 
-          {:error, :not_found} ->
-            Logger.info("Storage already deleted for #{state.key}")
+                {:error, :not_found} ->
+                  Logger.info("Storage already deleted for #{state.key}")
+                  :ok
 
-          {:error, reason} ->
-            Logger.error("Failed to delete storage for #{state.key}: #{inspect(reason)}")
-        end
+                {:error, reason} ->
+                  Logger.error("Failed to delete storage for #{state.key}: #{inspect(reason)}")
+                  {:error, reason}
+              end
+
+            {:error, _reason} = error ->
+              error
+          end
 
         {final_status, sync_result}
 
@@ -2078,15 +2090,22 @@ defmodule DurableServer do
   end
 
   defp maybe_sync_final_status(%DurableServer{} = state, status) when is_atom(status) do
+    case persist_final_status(state, status) do
+      {:ok, %DurableServer{}} -> :ok
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp persist_final_status(%DurableServer{} = state, status) when is_atom(status) do
     report_sync_and_stop = state.terminator_handled and status == :stopped_graceful
 
     case sync_to_storage(state, meta: %{status: status}) do
-      {:ok, %DurableServer{} = _new_state} ->
+      {:ok, %DurableServer{} = new_state} ->
         if report_sync_and_stop do
           LifecycleManager.report_diagnostic(state.supervisor, :sync_and_stop_ok)
         end
 
-        :ok
+        {:ok, new_state}
 
       {:error, sync_reason} ->
         if report_sync_and_stop do
