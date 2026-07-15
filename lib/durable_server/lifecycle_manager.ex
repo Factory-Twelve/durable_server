@@ -1056,6 +1056,15 @@ defmodule DurableServer.LifecycleManager do
   defp heartbeat_write_retryable?({:mirror_failed, reason}),
     do: heartbeat_write_retryable?(reason)
 
+  defp heartbeat_write_retryable?(%Req.Response{status: status}),
+    do: status in [408, 429, 500, 502, 503, 504]
+
+  defp heartbeat_write_retryable?(%Req.TransportError{reason: reason}),
+    do: reason in [:timeout, :econnrefused, :closed]
+
+  defp heartbeat_write_retryable?(%Req.HTTPError{protocol: :http2, reason: :unprocessed}),
+    do: true
+
   defp heartbeat_write_retryable?(reason) do
     reason in [
       :no_quorum,

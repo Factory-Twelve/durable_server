@@ -28,7 +28,9 @@ defmodule DurableServer.SupervisorBackendSpecTest do
        %{
          state: %{
            table: :ets.new(__MODULE__, [:set, :public]),
-           name: Map.get(opts, :name)
+           control_table: init_control_table(opts),
+           name: Map.get(opts, :name),
+           owner: Map.get(opts, :owner)
          },
          defaults: %{
            heartbeat_tracking_mode: :poll,
@@ -59,10 +61,17 @@ defmodule DurableServer.SupervisorBackendSpecTest do
     end
 
     @impl true
-    def put_object(%{table: table}, key, data, _opts) do
-      etag = next_etag()
-      :ets.insert(table, {key, %{body: data, etag: etag}})
-      {:ok, %{body: data, etag: etag}}
+    def put_object(%{table: table} = state, key, data, _opts) do
+      case pop_heartbeat_failure(state, key) do
+        {:error, reason} ->
+          if state.owner, do: send(state.owner, {:heartbeat_put_failed, reason})
+          {:error, reason}
+
+        :ok ->
+          etag = next_etag()
+          :ets.insert(table, {key, %{body: data, etag: etag}})
+          {:ok, %{body: data, etag: etag}}
+      end
     end
 
     @impl true
@@ -91,10 +100,10 @@ defmodule DurableServer.SupervisorBackendSpecTest do
     end
 
     @impl true
-    def update_object(%{table: table} = state, key, update_fn, _opts) do
+    def update_object(state, key, update_fn, _opts) do
       with {:ok, %{body: body, etag: etag}} <- get_object(state, key, []),
            {:ok, new_body} <- update_fn.(%{body: body, etag: etag}) do
-        put_object(%{table: table}, key, new_body, [])
+        put_object(state, key, new_body, [])
       end
     end
 
@@ -104,10 +113,54 @@ defmodule DurableServer.SupervisorBackendSpecTest do
     @impl true
     def decode(_state, data), do: {:ok, data}
 
+    defp init_control_table(opts) do
+      table = :ets.new(__MODULE__, [:set, :public])
+      :ets.insert(table, {:heartbeat_failures, Map.get(opts, :heartbeat_failures, [])})
+      table
+    end
+
+    defp pop_heartbeat_failure(%{control_table: table}, key) do
+      if String.contains?(key, "__nodes/") do
+        case :ets.lookup(table, :heartbeat_failures) do
+          [{:heartbeat_failures, [reason | rest]}] ->
+            :ets.insert(table, {:heartbeat_failures, rest})
+            {:error, reason}
+
+          _ ->
+            :ok
+        end
+      else
+        :ok
+      end
+    end
+
     defp next_etag do
       System.unique_integer([:positive, :monotonic])
       |> Integer.to_string()
     end
+  end
+
+  test "retries transient Req heartbeat failures during startup" do
+    supervisor_name = unique_supervisor_name("heartbeat_retry")
+    prefix = unique_prefix("heartbeat_retry")
+    response = %Req.Response{status: 503}
+    transport_error = %Req.TransportError{reason: :timeout}
+
+    start_supervised!(
+      {DurableServer.Supervisor,
+       [
+         name: supervisor_name,
+         prefix: prefix,
+         backend:
+           {InMemoryBackend,
+            name: :heartbeat_retry, owner: self(), heartbeat_failures: [response, transport_error]},
+         graceful_shutdown_timeout_ms: 500
+       ]}
+    )
+
+    assert_receive {:heartbeat_put_failed, ^response}
+    assert_receive {:heartbeat_put_failed, ^transport_error}
+    assert Process.alive?(Process.whereis(LifecycleManager.name(supervisor_name)))
   end
 
   test "accepts backend module spec directly" do
