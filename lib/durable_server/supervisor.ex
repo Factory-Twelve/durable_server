@@ -802,6 +802,8 @@ defmodule DurableServer.Supervisor do
           raise ArgumentError, "#{function_name} requires :key"
       end
 
+    validate_durable_key!(key, function_name)
+
     initial_state =
       case Keyword.fetch(args, :initial_state) do
         {:ok, initial_state} when is_map(initial_state) ->
@@ -823,6 +825,15 @@ defmodule DurableServer.Supervisor do
   defp validate_child_init_arg!(init_arg, function_name) do
     raise ArgumentError,
           "#{function_name} expects {Module, key: \"...\", initial_state: %{...}}, got: #{inspect(init_arg)}"
+  end
+
+  defp validate_durable_key!(key, function_name) do
+    if key == "__nodes" or String.starts_with?(key, "__nodes/") do
+      raise ArgumentError,
+            "#{function_name} :key uses the reserved internal namespace __nodes/: #{inspect(key)}"
+    end
+
+    :ok
   end
 
   defp do_start_child_with_init_arg(supervisor, {module, init_arg, boot_info}, opts) do

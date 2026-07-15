@@ -849,6 +849,18 @@ defmodule DurableServerTest do
       end
     end
 
+    test "rejects child keys in the internal heartbeat namespace", %{
+      supervisor_name: supervisor_name,
+      prefix: _prefix
+    } do
+      assert_raise ArgumentError, ~r/reserved internal namespace/, fn ->
+        DurableServer.Supervisor.start_child(
+          supervisor_name,
+          {TestServer, key: "__nodes/future@host", initial_state: %{}}
+        )
+      end
+    end
+
     test "validates child args require map :initial_state", %{
       supervisor_name: supervisor_name,
       prefix: _prefix
