@@ -376,7 +376,6 @@ defmodule DurableServer.MirrorBackendE2ETest do
     :ok = Supervisor.stop(pid)
     assert_receive {:DOWN, ^monitor_ref, :process, ^pid, _reason}, 5_000
     assert_eventually(fn -> Process.whereis(supervisor_name) == nil end)
-    :persistent_term.erase({DurableServer.Supervisor, :prefix, prefix})
     :ok
   end
 

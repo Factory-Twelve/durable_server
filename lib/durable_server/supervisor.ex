@@ -673,23 +673,51 @@ defmodule DurableServer.Supervisor do
       raise ArgumentError, "prefix must end with '/', got: #{inspect(prefix)}"
     end
 
-    # claim the prefix to prevent conflicts between supervisors
-    prefix_key = {__MODULE__, :prefix, prefix}
+    ensure_prefix_unclaimed!(prefix)
+    Supervisor.start_link(__MODULE__, opts, name: name)
+  end
 
-    case :persistent_term.get(prefix_key, nil) do
-      nil ->
-        :persistent_term.put(prefix_key, name)
+  defp ensure_prefix_unclaimed!(prefix) do
+    deadline = System.monotonic_time(:millisecond) + 1_000
+    await_prefix_release!(prefix, deadline)
+  end
 
-      existing_name when existing_name != name ->
+  defp await_prefix_release!(prefix, deadline) do
+    case Registry.lookup(DurableServer.PrefixRegistry, prefix) do
+      [] ->
+        :ok
+
+      [{pid, existing_name}] ->
+        if Process.alive?(pid) do
+          raise ArgumentError,
+                "prefix #{inspect(prefix)} is already claimed by supervisor #{inspect(existing_name)}"
+        else
+          if System.monotonic_time(:millisecond) < deadline do
+            Process.sleep(1)
+            await_prefix_release!(prefix, deadline)
+          else
+            raise ArgumentError,
+                  "timed out releasing prefix #{inspect(prefix)} from a stopped owner"
+          end
+        end
+    end
+  end
+
+  defp claim_prefix!(prefix, name) do
+    case Registry.register(DurableServer.PrefixRegistry, prefix, name) do
+      {:ok, _owner} ->
+        :ok
+
+      {:error, {:already_registered, owner_pid}} ->
+        existing_name =
+          case Registry.lookup(DurableServer.PrefixRegistry, prefix) do
+            [{^owner_pid, owner_name}] -> owner_name
+            _ -> owner_pid
+          end
+
         raise ArgumentError,
               "prefix #{inspect(prefix)} is already claimed by supervisor #{inspect(existing_name)}"
-
-      ^name ->
-        raise ArgumentError,
-              "the prefix #{inspect(prefix)} has already been claimed by another process"
     end
-
-    Supervisor.start_link(__MODULE__, opts, name: name)
   end
 
   @doc false
@@ -3148,6 +3176,7 @@ defmodule DurableServer.Supervisor do
 
     name = Keyword.fetch!(opts, :name)
     prefix = Keyword.fetch!(opts, :prefix)
+    :ok = claim_prefix!(prefix, name)
 
     # Extract infrastructure options with defaults
     finch = Keyword.get(opts, :finch, DurableServer.Finch)

@@ -719,6 +719,52 @@ defmodule DurableServerTest do
   end
 
   describe "init/1" do
+    test "releases its prefix claim when the supervisor stops", %{prefix: _prefix} do
+      unique_id = DurableServer.UUID.uuid4()
+      supervisor_name = :"restartable_supervisor_#{unique_id}"
+      prefix = "restartable_#{unique_id}/"
+      opts = [name: supervisor_name, prefix: prefix, object_store: test_object_store_opts()]
+
+      assert {:ok, first_pid} = DurableServer.Supervisor.start_link(opts)
+
+      assert_raise ArgumentError, ~r/already claimed by supervisor/, fn ->
+        DurableServer.Supervisor.start_link(
+          Keyword.put(opts, :name, :"competing_supervisor_#{unique_id}")
+        )
+      end
+
+      assert :ok = Supervisor.stop(first_pid)
+      assert {:ok, second_pid} = DurableServer.Supervisor.start_link(opts)
+      assert :ok = Supervisor.stop(second_pid)
+    end
+
+    test "releases its prefix claim when startup fails", %{prefix: _prefix} do
+      unique_id = DurableServer.UUID.uuid4()
+      supervisor_name = :"failed_restartable_supervisor_#{unique_id}"
+      prefix = "failed_restartable_#{unique_id}/"
+
+      invalid_opts = [
+        name: supervisor_name,
+        prefix: prefix,
+        backend: {ConsistencyProbeBackend, owner: self()},
+        heartbeat_interval_ms: 0
+      ]
+
+      failed_start =
+        Task.async(fn ->
+          Process.flag(:trap_exit, true)
+          DurableServer.Supervisor.start_link(invalid_opts)
+        end)
+
+      assert {:error, _reason} = Task.await(failed_start)
+
+      valid_opts =
+        Keyword.delete(invalid_opts, :heartbeat_interval_ms)
+
+      assert {:ok, supervisor_pid} = DurableServer.Supervisor.start_link(valid_opts)
+      assert :ok = Supervisor.stop(supervisor_pid)
+    end
+
     test "initializes successfully with valid options", %{
       supervisor_name: supervisor_name,
       prefix: _prefix
