@@ -2698,6 +2698,50 @@ defmodule DurableServerTest do
       assert data.meta.status == :crashed
     end
 
+    test "a stale crashing process does not mark a newer owner as crashed", %{
+      prefix: _prefix
+    } do
+      {supervisor_name, _supervisor_pid, prefix} =
+        start_test_supervisor(backend: {ConsistencyProbeBackend, owner: self()})
+
+      key = "stale-crash-owner-#{DurableServer.UUID.uuid4()}"
+
+      {:ok, {pid, _meta}} =
+        DurableServer.Supervisor.start_child(
+          supervisor_name,
+          {EdgeCaseTestServer, key: key, initial_state: %{count: 0}}
+        )
+
+      %{storage_backend: backend} = DurableServer.Supervisor.__get_config__(supervisor_name)
+      storage_key = prefix <> key
+
+      assert {:ok, %{body: stored_state, etag: etag}} =
+               StorageBackend.get_object(backend, storage_key)
+
+      newer_owner =
+        stored_state.meta
+        |> Map.put(:pid, self())
+        |> Map.update!(:node_ref, &(&1 + 1))
+        |> Meta.put_status(:running)
+
+      assert {:ok, _obj} =
+               StorageBackend.put_object(
+                 backend,
+                 storage_key,
+                 %{stored_state | meta: newer_owner},
+                 etag: etag
+               )
+
+      ref = Process.monitor(pid)
+      assert catch_exit(GenServer.call(pid, :crash))
+      assert_receive {:DOWN, ^ref, :process, ^pid, _reason}
+
+      assert {:ok, %{body: final_state}} = StorageBackend.get_object(backend, storage_key)
+      assert final_state.meta.pid == self()
+      assert final_state.meta.node_ref == newer_owner.node_ref
+      assert final_state.meta.status == :running
+    end
+
     test "abnormal stop reasons mark status as crashed", %{
       supervisor_name: supervisor_name,
       prefix: prefix

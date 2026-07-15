@@ -3179,15 +3179,19 @@ defmodule DurableServer do
     store = state.object_store
 
     case StorageBackend.get_object(store, storage_key, consistent: true) do
-      {:ok, %{body: %StoredState{} = stored_state, etag: etag}} ->
-        updated_data =
-          stored_state
-          |> attach_stored_state_context(%{key: state.key, prefix: state.prefix})
-          |> Map.put(:meta, updated_meta)
+      {:ok, %{body: %StoredState{meta: %Meta{} = current_meta} = stored_state, etag: etag}} ->
+        if same_boot_owner?(state, current_meta) do
+          updated_data =
+            stored_state
+            |> attach_stored_state_context(%{key: state.key, prefix: state.prefix})
+            |> Map.put(:meta, updated_meta)
 
-        case put_object(%{state | etag: etag}, storage_key, updated_data) do
-          {:ok, %DurableServer{} = new_state} -> {:ok, new_state}
-          {:error, reason} -> {:error, reason}
+          case put_object(%{state | etag: etag}, storage_key, updated_data) do
+            {:ok, %DurableServer{} = new_state} -> {:ok, new_state}
+            {:error, reason} -> {:error, reason}
+          end
+        else
+          {:error, :ownership_mismatch}
         end
 
       {:ok, %{body: other}} ->
