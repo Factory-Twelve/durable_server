@@ -3498,7 +3498,19 @@ defmodule DurableServer.Supervisor do
 
     warn_on_shutdown_timeout_mismatch(config, backend_resources)
 
-    Logger.info("starting #{inspect(name)}: #{inspect(config)}")
+    logged_config =
+      config
+      |> Map.drop([
+        :storage_backend,
+        :heartbeat_backend,
+        :object_store,
+        :circuit_breaker,
+        :init_info
+      ])
+      |> Map.put(:storage_backend, config.storage_backend.adapter)
+      |> Map.put(:heartbeat_backend, config.heartbeat_backend.adapter)
+
+    Logger.info("starting #{inspect(name)}: #{inspect(logged_config)}")
 
     :ets.insert(table_name, {:config, config})
     :ets.insert(table_name, {:capacity_limits, capacity_limits})
@@ -3868,9 +3880,9 @@ defmodule DurableServer.Supervisor do
     init_backend!(adapter, raw_opts)
   end
 
-  defp init_backend_spec(spec, _finch, _task_sup) do
+  defp init_backend_spec(_spec, _finch, _task_sup) do
     raise ArgumentError,
-          "invalid :backend option #{inspect(spec)}. Expected {BackendModule, opts} or %DurableServer.StorageBackend{}"
+          "invalid :backend option. Expected {BackendModule, opts} or %DurableServer.StorageBackend{}"
   end
 
   defp prepare_backend_init_opts(
@@ -3916,17 +3928,16 @@ defmodule DurableServer.Supervisor do
       {:ok, %StorageBackend{} = backend} ->
         backend
 
-      {:error, reason} ->
-        raise ArgumentError,
-              "failed to initialize backend #{inspect(adapter)} with #{inspect(raw_opts)}: #{inspect(reason)}"
+      {:error, _reason} ->
+        raise ArgumentError, "failed to initialize backend #{inspect(adapter)}"
     end
   end
 
   defp normalize_backend_opts(opts) when is_list(opts), do: opts
   defp normalize_backend_opts(opts) when is_map(opts), do: Map.to_list(opts)
 
-  defp normalize_backend_opts(other) do
-    raise ArgumentError, "expected backend options as keyword or map, got: #{inspect(other)}"
+  defp normalize_backend_opts(_other) do
+    raise ArgumentError, "expected backend options as keyword or map"
   end
 
   defp maybe_extract_object_store(%StorageBackend{
