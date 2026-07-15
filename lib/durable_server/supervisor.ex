@@ -1555,7 +1555,12 @@ defmodule DurableServer.Supervisor do
 
   defp restart_claim_race_final_retry?(_retries, _remaining_ms), do: false
 
-  defp try_remote_placement(supervisor, {module, init_arg, boot_info} = child_spec, max_retries) do
+  defp try_remote_placement(
+         supervisor,
+         {module, init_arg, boot_info} = child_spec,
+         max_retries,
+         deadline
+       ) do
     key = Keyword.fetch!(init_arg, :key)
 
     sticky_placement =
@@ -1590,7 +1595,8 @@ defmodule DurableServer.Supervisor do
       nodes ->
         try_nodes(supervisor, child_spec, nodes,
           key: key,
-          sticky_placement: sticky_placement
+          sticky_placement: sticky_placement,
+          deadline: deadline
         )
     end
   end
@@ -1671,7 +1677,7 @@ defmodule DurableServer.Supervisor do
   end
 
   defp try_remote_placement_with_retry(supervisor, child_spec, max_retries, deadline) do
-    case try_remote_placement(supervisor, child_spec, max_retries) do
+    case try_remote_placement(supervisor, child_spec, max_retries, deadline) do
       {:ok, result} ->
         {:ok, result}
 
@@ -1783,11 +1789,17 @@ defmodule DurableServer.Supervisor do
     Logger.info("Attempting to place #{inspect(module)} on remote node #{inspect(node)}")
     report_placement_diagnostic(supervisor, :remote_placement_erpc_attempt)
     shutdown_retries = Keyword.get(placement_opts, :shutdown_retries, 0)
-    erpc_timeout_ms = placement_erpc_timeout_ms(supervisor, node)
+    deadline = Keyword.get(placement_opts, :deadline)
+    erpc_timeout_ms = __placement_erpc_timeout_ms__(supervisor, node, deadline)
     {remote_child_spec, remote_opts} = remote_start_child_args(child_spec)
+    remote_opts = Keyword.put(remote_opts, :timeout, erpc_timeout_ms)
 
     # NOTE: we MUST pass max_placement_retries: 0 to prevent recursive retry on the other side
     try do
+      if erpc_timeout_ms == 0 do
+        throw({:error, :placement_deadline_expired})
+      end
+
       result =
         safe_erpc_call(
           node,
@@ -1823,6 +1835,9 @@ defmodule DurableServer.Supervisor do
           try_nodes(supervisor, child_spec, rest, placement_opts)
       end
     catch
+      :throw, {:error, :placement_deadline_expired} ->
+        {:error, :timeout}
+
       :throw, {:error, :not_ready} ->
         report_placement_diagnostic(supervisor, :remote_placement_not_ready)
         Logger.warning("Node #{inspect(node)} not ready (still starting up), trying next node")
@@ -1886,6 +1901,17 @@ defmodule DurableServer.Supervisor do
         )
 
         try_nodes(supervisor, child_spec, rest, placement_opts)
+    end
+  end
+
+  @doc false
+  def __placement_erpc_timeout_ms__(supervisor, node, deadline)
+      when is_atom(supervisor) and is_atom(node) do
+    configured_timeout = placement_erpc_timeout_ms(supervisor, node)
+
+    case remaining_timeout_ms(deadline) do
+      :infinity -> configured_timeout
+      remaining_ms -> min(configured_timeout, remaining_ms)
     end
   end
 
@@ -2528,7 +2554,7 @@ defmodule DurableServer.Supervisor do
          deadline
        ) do
     # First attempt remote placement (single round, no retry loop — we handle retry here)
-    case try_remote_placement(supervisor, child_spec, 3) do
+    case try_remote_placement(supervisor, child_spec, 3, deadline) do
       {:ok, result} ->
         {:ok, result}
 

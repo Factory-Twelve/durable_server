@@ -132,6 +132,40 @@ defmodule DurableServer.SupervisorBackendSpecTest do
     assert object_store == nil
   end
 
+  test "caps placement ERPC timeout by the caller deadline" do
+    supervisor_name = unique_supervisor_name("placement_deadline")
+    prefix = unique_prefix("placement_deadline")
+
+    start_supervised!(
+      {DurableServer.Supervisor,
+       [
+         name: supervisor_name,
+         prefix: prefix,
+         backend: {InMemoryBackend, name: :placement_deadline},
+         placement_erpc_timeout_cross_region_ms: 8_000
+       ]}
+    )
+
+    deadline = System.monotonic_time(:millisecond) + 25
+
+    timeout =
+      DurableServer.Supervisor.__placement_erpc_timeout_ms__(
+        supervisor_name,
+        :remote@host,
+        deadline
+      )
+
+    assert timeout > 0
+    assert timeout <= 25
+
+    assert 0 ==
+             DurableServer.Supervisor.__placement_erpc_timeout_ms__(
+               supervisor_name,
+               :remote@host,
+               System.monotonic_time(:millisecond) - 1
+             )
+  end
+
   test "child_spec uses configured supervisor shutdown timeout" do
     shutdown_timeout = 12_345
     supervisor_name = unique_supervisor_name("child_spec")
