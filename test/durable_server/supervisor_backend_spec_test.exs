@@ -140,6 +140,42 @@ defmodule DurableServer.SupervisorBackendSpecTest do
     end
   end
 
+  test "rejects heartbeats beyond the configured future clock-skew tolerance" do
+    supervisor_name = unique_supervisor_name("heartbeat_skew")
+    prefix = unique_prefix("heartbeat_skew")
+
+    start_supervised!(
+      {DurableServer.Supervisor,
+       [
+         name: supervisor_name,
+         prefix: prefix,
+         backend: {InMemoryBackend, name: :heartbeat_skew},
+         heartbeat_future_skew_tolerance_ms: 50,
+         graceful_shutdown_timeout_ms: 500
+       ]}
+    )
+
+    table = :"durable_server_heartbeats_#{supervisor_name}"
+    node_str = "future-heartbeat@host"
+    now = System.system_time(:millisecond)
+
+    :ets.insert(table, {node_str, 1, now + 5_000, nil, nil, %{}, %{}})
+
+    assert :stale =
+             LifecycleManager.lookup_node_health(%{
+               supervisor: supervisor_name,
+               node_str: node_str
+             })
+
+    :ets.insert(table, {node_str, 1, now + 25, nil, nil, %{}, %{}})
+
+    assert {:healthy, %{node_ref: 1}} =
+             LifecycleManager.lookup_node_health(%{
+               supervisor: supervisor_name,
+               node_str: node_str
+             })
+  end
+
   test "retries transient Req heartbeat failures during startup" do
     supervisor_name = unique_supervisor_name("heartbeat_retry")
     prefix = unique_prefix("heartbeat_retry")

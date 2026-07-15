@@ -122,7 +122,7 @@ defmodule DurableServer.HeartbeatWatchdog do
         {:heartbeat_deadline, timer_token},
         %__MODULE__{timer_token: timer_token} = state
       ) do
-    elapsed_since_last = System.system_time(:millisecond) - state.last_heartbeat_at
+    elapsed_since_last = System.monotonic_time(:millisecond) - state.last_heartbeat_at
 
     Logger.error(fn ->
       "#{inspect(state.supervisor_name)}: heartbeat watchdog deadline exceeded " <>
@@ -149,7 +149,7 @@ defmodule DurableServer.HeartbeatWatchdog do
 
   defp schedule_deadline(%__MODULE__{} = state) do
     deadline_at = state.last_heartbeat_at + state.deadline_ms
-    delay_ms = max(deadline_at - System.system_time(:millisecond), 0)
+    delay_ms = max(deadline_at - System.monotonic_time(:millisecond), 0)
     timer_token = make_ref()
     timer_ref = Process.send_after(self(), {:heartbeat_deadline, timer_token}, delay_ms)
 

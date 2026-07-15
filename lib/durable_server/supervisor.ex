@@ -57,7 +57,7 @@ defmodule DurableServer.Supervisor do
   ### Node Heartbeats
 
   The LifecycleManager maintains node-level heartbeats in object storage at
-  `{prefix}nodes/{node_name}` and caches them locally for efficient health
+  `{prefix}__nodes/{node_name}` and caches them locally for efficient health
   checking during restart decisions.
 
   ## Configuration Options
@@ -88,6 +88,8 @@ defmodule DurableServer.Supervisor do
   - `:heartbeat_interval_ms` - How often to write node heartbeats (default: 10_000)
   - `:heartbeat_staleness_threshold_ms` - How long a node heartbeat may go without success
     before the node is considered stale/orphan-claimable (default: 30_000)
+  - `:heartbeat_future_skew_tolerance_ms` - Maximum accepted clock lead in a persisted
+    cross-node heartbeat (default: 5_000)
   - `:heartbeat_tracking_mode` - Heartbeat cache strategy: `:poll` or `:subscribe`.
     Defaults from backend capabilities.
   - `:heartbeat_reconcile_interval_ms` - Full heartbeat cache reconcile interval used
@@ -229,6 +231,7 @@ defmodule DurableServer.Supervisor do
   @default_parallel_restart_batch_size 50
   @default_restart_start_timeout_ms 30_000
   @default_heartbeat_staleness_threshold_ms 30_000
+  @default_heartbeat_future_skew_tolerance_ms 5_000
   @default_restart_claim_preferred_fanout 2
   @default_restart_claim_expanded_fanout 4
   @default_restart_claim_gate_expand_after_ms :timer.seconds(30)
@@ -3228,6 +3231,7 @@ defmodule DurableServer.Supervisor do
         :restart_claim_gate_disable_after_ms,
         :heartbeat_interval_ms,
         :heartbeat_staleness_threshold_ms,
+        :heartbeat_future_skew_tolerance_ms,
         :heartbeat_tracking_mode,
         :heartbeat_reconcile_interval_ms,
         :graceful_shutdown_timeout_ms,
@@ -3359,6 +3363,13 @@ defmodule DurableServer.Supervisor do
         @default_heartbeat_staleness_threshold_ms
       )
 
+    heartbeat_future_skew_tolerance_ms =
+      extract_non_negative_integer!(
+        opts,
+        :heartbeat_future_skew_tolerance_ms,
+        @default_heartbeat_future_skew_tolerance_ms
+      )
+
     max_heartbeat_interval = div(heartbeat_staleness_threshold_ms, 2)
 
     if heartbeat_interval_ms > max_heartbeat_interval do
@@ -3468,6 +3479,7 @@ defmodule DurableServer.Supervisor do
       restart_claim_gate_disable_after_ms: restart_claim_gate_disable_after_ms,
       heartbeat_interval_ms: heartbeat_interval_ms,
       heartbeat_staleness_threshold_ms: heartbeat_staleness_threshold_ms,
+      heartbeat_future_skew_tolerance_ms: heartbeat_future_skew_tolerance_ms,
       heartbeat_tracking_mode: heartbeat_tracking_mode,
       heartbeat_reconcile_interval_ms: heartbeat_reconcile_interval_ms,
       graceful_shutdown_timeout_ms: Keyword.get(opts, :graceful_shutdown_timeout_ms, 30_000),

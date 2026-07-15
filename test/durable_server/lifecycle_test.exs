@@ -2597,8 +2597,12 @@ defmodule DurableServer.LifecycleTest do
       assert [{:heartbeat_write, %{"last_heartbeat_at" => stored_heartbeat_at}}] =
                :ets.lookup(table, :heartbeat_write)
 
-      # Remote stale checks use this stored timestamp, so local self-kill math must too.
+      # The persisted wall timestamp remains available for cross-node freshness checks,
+      # while local deadline arithmetic tracks the equivalent monotonic instant.
       assert abs(manager_state.last_successful_heartbeat_at - stored_heartbeat_at) < 500
+
+      assert System.monotonic_time(:millisecond) -
+               manager_state.last_successful_heartbeat_monotonic_at < 3_000
 
       GenServer.stop(manager_pid)
     end
@@ -2709,7 +2713,10 @@ defmodule DurableServer.LifecycleTest do
         {us, result} =
           :timer.tc(fn ->
             LifecycleManager.handle_info(
-              {ref, {:heartbeat, {%{total_ms: 10, put_ms: 5, cache_ms: 5}, heartbeat_entry}}},
+              {ref,
+               {:heartbeat,
+                {%{total_ms: 10, put_ms: 5, cache_ms: 5}, heartbeat_entry,
+                 System.monotonic_time(:millisecond)}}},
               state
             )
           end)
