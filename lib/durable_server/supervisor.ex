@@ -2309,7 +2309,7 @@ defmodule DurableServer.Supervisor do
     owner_registry = ensure_started_singleflight_registry_name(supervisor)
     waiters_registry = ensure_started_singleflight_waiters_registry_name(supervisor)
 
-    case Registry.register(owner_registry, singleflight_key, :singleflight_owner) do
+    case safe_registry_register(owner_registry, singleflight_key, :singleflight_owner) do
       {:ok, _owner_pid} ->
         report_singleflight_diagnostic(supervisor, diagnostics, :leader)
 
@@ -2339,11 +2339,17 @@ defmodule DurableServer.Supervisor do
           wait_timeout_ms,
           diagnostics
         )
+
+      {:error, :registry_unavailable} ->
+        # Supervisor is shutting down or the registry is already gone.
+        {:result, fun.()}
     end
+  end
+
+  defp safe_registry_register(registry, key, value) do
+    Registry.register(registry, key, value)
   rescue
-    ArgumentError ->
-      # Supervisor is shutting down or registry already gone; fall back to direct call.
-      {:result, fun.()}
+    ArgumentError -> {:error, :registry_unavailable}
   end
 
   defp wait_for_supervisor_singleflight_owner(
@@ -2374,12 +2380,14 @@ defmodule DurableServer.Supervisor do
 
           result =
             try do
-              case Registry.register(
+              case __register_singleflight_waiter__(
+                     owner_registry,
                      waiters_registry,
                      singleflight_key,
+                     owner_pid,
                      {waiter_ref, reply_alias}
                    ) do
-                {:ok, _} ->
+                :wait ->
                   receive do
                     {:singleflight_done, ^singleflight_key, ^waiter_ref, singleflight_result} ->
                       {:result, singleflight_result}
@@ -2405,8 +2413,11 @@ defmodule DurableServer.Supervisor do
                       end
                   end
 
-                {:error, {:already_registered, _}} ->
+                :retry ->
                   :retry
+
+                {:follow_owner, new_owner_pid} ->
+                  {:follow_owner, new_owner_pid}
               end
             after
               :erlang.unalias(reply_alias)
@@ -2432,6 +2443,30 @@ defmodule DurableServer.Supervisor do
               other
           end
       end
+    end
+  rescue
+    ArgumentError -> :retry
+  end
+
+  @doc false
+  def __register_singleflight_waiter__(
+        owner_registry,
+        waiters_registry,
+        singleflight_key,
+        owner_pid,
+        waiter_value
+      )
+      when is_atom(owner_registry) and is_atom(waiters_registry) and is_pid(owner_pid) do
+    case Registry.register(waiters_registry, singleflight_key, waiter_value) do
+      {:ok, _} ->
+        case Registry.lookup(owner_registry, singleflight_key) do
+          [{^owner_pid, _value}] -> :wait
+          [{new_owner_pid, _value}] when is_pid(new_owner_pid) -> {:follow_owner, new_owner_pid}
+          [] -> :retry
+        end
+
+      {:error, {:already_registered, _pid}} ->
+        :retry
     end
   rescue
     ArgumentError -> :retry

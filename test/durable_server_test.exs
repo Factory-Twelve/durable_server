@@ -2575,6 +2575,56 @@ defmodule DurableServerTest do
       assert_receive {:DOWN, ^ref, :process, ^blocked_pid, _reason}, 2_000
     end
 
+    test "singleflight waiter retries when the owner finishes before waiter registration", %{
+      supervisor_name: supervisor_name,
+      prefix: _prefix
+    } do
+      singleflight_key =
+        {:ensure_started_child, "registration-race", DurableServerTest.BlockingInitServer}
+
+      owner_registry = :"durable_sf_owner_#{supervisor_name}"
+      waiters_registry = :"durable_sf_waiters_#{supervisor_name}"
+      parent = self()
+
+      owner_pid =
+        spawn(fn ->
+          {:ok, _} = Registry.register(owner_registry, singleflight_key, :singleflight_owner)
+          send(parent, {:singleflight_owner_ready, self()})
+
+          receive do
+            :finish ->
+              Registry.dispatch(waiters_registry, singleflight_key, fn _entries -> :ok end)
+              Registry.unregister(owner_registry, singleflight_key)
+              send(parent, {:singleflight_owner_finished, self()})
+
+              receive do
+                :stop -> :ok
+              end
+          end
+        end)
+
+      assert_receive {:singleflight_owner_ready, ^owner_pid}
+      send(owner_pid, :finish)
+      assert_receive {:singleflight_owner_finished, ^owner_pid}
+      assert Process.alive?(owner_pid)
+
+      waiter_ref = make_ref()
+      reply_alias = :erlang.alias()
+
+      assert :retry =
+               DurableServer.Supervisor.__register_singleflight_waiter__(
+                 owner_registry,
+                 waiters_registry,
+                 singleflight_key,
+                 owner_pid,
+                 {waiter_ref, reply_alias}
+               )
+
+      :erlang.unalias(reply_alias)
+      Registry.unregister(waiters_registry, singleflight_key)
+      send(owner_pid, :stop)
+    end
+
     test "timed out singleflight waiter does not receive late singleflight_done", %{
       supervisor_name: supervisor_name,
       prefix: _prefix
