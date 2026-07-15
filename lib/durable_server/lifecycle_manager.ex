@@ -285,8 +285,8 @@ defmodule DurableServer.LifecycleManager do
 
   defp high_cardinality_diag_key?(_), do: false
 
-  def stop_discovery(supervisor_name) do
-    GenServer.call(name(supervisor_name), :stop_discovery)
+  def stop_discovery(supervisor_name, timeout \\ 5_000) do
+    GenServer.call(name(supervisor_name), :stop_discovery, timeout)
   end
 
   @impl true

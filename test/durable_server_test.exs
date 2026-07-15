@@ -614,6 +614,18 @@ defmodule DurableServerTest do
     end
   end
 
+  defmodule SlowTerminateServer do
+    use DurableServer, vsn: 1
+
+    def dump_state(state), do: state
+    def load_state(_old_vsn, state), do: DurableServerTest.atomify_keys(state)
+
+    def terminate(_reason, %{terminate_sleep_ms: sleep_ms}) do
+      Process.sleep(sleep_ms)
+      :ok
+    end
+  end
+
   defmodule InitInfoServer do
     use DurableServer, vsn: 1
 
@@ -2214,6 +2226,76 @@ defmodule DurableServerTest do
       actual_count = GenServer.call(pid2, :get_count)
       # Should get the previous state (count: 1) since first server had incremented and synced
       assert actual_count == 1
+    end
+  end
+
+  describe "graceful shutdown" do
+    test "reports final persistence failures", %{prefix: _prefix} do
+      unique_id = DurableServer.UUID.uuid4()
+      supervisor_name = :"shutdown_failure_#{unique_id}"
+      prefix = "shutdown_failure_#{unique_id}/"
+
+      assert {:ok, supervisor_pid} =
+               DurableServer.Supervisor.start_link(
+                 name: supervisor_name,
+                 prefix: prefix,
+                 backend: {ConsistencyProbeBackend, owner: self()}
+               )
+
+      key = "shutdown-sync-failure"
+
+      assert {:ok, {_server_pid, _meta}} =
+               DurableServer.Supervisor.start_child(
+                 supervisor_name,
+                 {TestServer, key: key, initial_state: %{}}
+               )
+
+      %{storage_backend: backend} = DurableServer.Supervisor.__get_config__(supervisor_name)
+      storage_key = prefix <> key
+
+      assert {:ok, %{body: stored_state, etag: etag}} =
+               StorageBackend.get_object(backend, storage_key)
+
+      assert {:ok, _obj} =
+               StorageBackend.put_object(backend, storage_key, stored_state, etag: etag)
+
+      log =
+        capture_log(fn -> assert :ok = Supervisor.stop(supervisor_pid, :normal, :infinity) end)
+
+      assert log =~ "1 DurableServer children failed final persistence during shutdown"
+    end
+
+    test "uses one timeout budget across all concurrency batches", %{prefix: _prefix} do
+      unique_id = DurableServer.UUID.uuid4()
+      supervisor_name = :"shutdown_budget_#{unique_id}"
+
+      assert {:ok, supervisor_pid} =
+               DurableServer.Supervisor.start_link(
+                 name: supervisor_name,
+                 prefix: "shutdown_budget_#{unique_id}/",
+                 backend: {ConsistencyProbeBackend, owner: self()},
+                 graceful_shutdown_concurrency: 1,
+                 graceful_shutdown_timeout_ms: 75
+               )
+
+      pids =
+        for index <- 1..4 do
+          key = "slow-shutdown-#{index}-#{DurableServer.UUID.uuid4()}"
+
+          assert {:ok, {pid, _meta}} =
+                   DurableServer.Supervisor.start_child(
+                     supervisor_name,
+                     {SlowTerminateServer, key: key, initial_state: %{terminate_sleep_ms: 1_000}}
+                   )
+
+          pid
+        end
+
+      {elapsed_us, :ok} = :timer.tc(fn -> Supervisor.stop(supervisor_pid, :normal, :infinity) end)
+      elapsed_ms = div(elapsed_us, 1_000)
+
+      assert elapsed_ms < 225
+      assert Enum.all?(pids, &(not Process.alive?(&1)))
     end
   end
 
