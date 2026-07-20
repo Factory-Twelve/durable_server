@@ -1419,11 +1419,6 @@ defmodule DurableServer do
 
         delete_by_pid(pid, timeout)
 
-      {:error, :not_found} ->
-        # object doesn't exist, consider this success
-        Logger.info("Object #{storage_key} already deleted")
-        :ok
-
       {:error, reason} ->
         Logger.error("Failed to acquire delete lock for #{storage_key}: #{inspect(reason)}")
         {:error, reason}

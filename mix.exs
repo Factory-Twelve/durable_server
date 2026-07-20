@@ -41,7 +41,6 @@ defmodule DurableServer.MixProject do
   defp deps do
     [
       {:group, "~> 0.2.0"},
-      {:jason, "~> 1.4"},
       {:req, "~> 0.5"},
       {:req_s3, "~> 0.2"},
       {:finch, "~> 0.18"},

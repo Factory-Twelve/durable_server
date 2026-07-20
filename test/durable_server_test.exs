@@ -1486,9 +1486,7 @@ defmodule DurableServerTest do
         )
 
       # Test that invalid meta types cause the GenServer call to exit with FunctionClauseError
-      catch_exit do
-        GenServer.call(pid, {:invalid_meta_test, "not_a_map"})
-      end
+      catch_exit(GenServer.call(pid, {:invalid_meta_test, "not_a_map"}))
     end
 
     test "handles stop with reply", %{pid: pid} do
