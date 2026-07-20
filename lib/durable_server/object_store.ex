@@ -920,7 +920,7 @@ defmodule DurableServer.ObjectStore do
       case timeout do
         nil -> nil
         :infinity -> nil
-        ms when is_integer(ms) -> System.system_time(:millisecond) + ms
+        ms when is_integer(ms) -> System.monotonic_time(:millisecond) + ms
       end
 
     # Add If-Match header for etag verification
@@ -948,19 +948,19 @@ defmodule DurableServer.ObjectStore do
           Req.merge(req,
             max_retries: retries,
             retry: fn
-              # don't retry good response, conflict, or not found
-              # 404 on PUT with if-match means object doesn't exist (localstack behavior)
               %Req.Request{}, %Req.Response{status: status}
-              when status in 200..299 or status in [404, 409, 412] ->
-                false
+              when status in [408, 429, 500, 502, 503, 504] ->
+                within_retry_deadline?(deadline_at)
 
-              # check deadline before retrying transient errors
-              %Req.Request{}, _exception ->
-                if deadline_at && System.system_time(:millisecond) >= deadline_at do
-                  false
-                else
-                  true
-                end
+              %Req.Request{}, %Req.TransportError{reason: reason}
+              when reason in [:timeout, :econnrefused, :closed] ->
+                within_retry_deadline?(deadline_at)
+
+              %Req.Request{}, %Req.HTTPError{protocol: :http2, reason: :unprocessed} ->
+                within_retry_deadline?(deadline_at)
+
+              %Req.Request{}, _response_or_exception ->
+                false
             end
           )
 
@@ -985,6 +985,12 @@ defmodule DurableServer.ObjectStore do
         Logger.error("Failed to put object with etag: #{inspect(key: key, error: reason)}")
         {:error, reason}
     end
+  end
+
+  defp within_retry_deadline?(nil), do: true
+
+  defp within_retry_deadline?(deadline_at) do
+    System.monotonic_time(:millisecond) < deadline_at
   end
 
   defp parse_etag!(%{} = headers_or_attrs) do

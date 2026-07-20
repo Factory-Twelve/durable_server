@@ -751,7 +751,11 @@ defmodule DurableServerTest do
       end
 
       assert :ok = Supervisor.stop(first_pid)
-      assert {:ok, second_pid} = DurableServer.Supervisor.start_link(opts)
+
+      restarted_opts =
+        Keyword.put(opts, :name, :"restarted_supervisor_#{unique_id}")
+
+      assert {:ok, second_pid} = DurableServer.Supervisor.start_link(restarted_opts)
       assert :ok = Supervisor.stop(second_pid)
     end
 
@@ -2265,7 +2269,7 @@ defmodule DurableServerTest do
       assert log =~ "1 DurableServer children failed final persistence during shutdown"
     end
 
-    test "uses one timeout budget across all concurrency batches", %{prefix: _prefix} do
+    test "uses one overall timeout budget across all concurrency batches", %{prefix: _prefix} do
       unique_id = DurableServer.UUID.uuid4()
       supervisor_name = :"shutdown_budget_#{unique_id}"
 
@@ -2275,7 +2279,8 @@ defmodule DurableServerTest do
                  prefix: "shutdown_budget_#{unique_id}/",
                  backend: {ConsistencyProbeBackend, owner: self()},
                  graceful_shutdown_concurrency: 1,
-                 graceful_shutdown_timeout_ms: 75
+                 graceful_shutdown_timeout_ms: 1_000,
+                 graceful_shutdown_total_timeout_ms: 75
                )
 
       pids =

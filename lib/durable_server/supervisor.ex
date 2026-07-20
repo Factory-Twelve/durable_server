@@ -94,6 +94,10 @@ defmodule DurableServer.Supervisor do
     Defaults from backend capabilities.
   - `:heartbeat_reconcile_interval_ms` - Full heartbeat cache reconcile interval used
     in `:subscribe` mode (default from backend capabilities).
+  - `:graceful_shutdown_timeout_ms` - Maximum time each child gets to persist and stop
+    once its shutdown begins (default: 30_000).
+  - `:graceful_shutdown_total_timeout_ms` - Maximum time for the complete coordinated
+    shutdown, including discovery and all child batches (default: 55_000).
   - `:dead_node_threshold_ms` - How long before a node is considered permanently dead and cleaned up
     (default: 86_400_000 = 24 hours)
   - `:crash_threshold_count` - Number of crashes before marking object as permanently crashed
@@ -653,6 +657,8 @@ defmodule DurableServer.Supervisor do
     (default: 30_000)
   - `:heartbeat_tracking_mode` - Heartbeat cache strategy: `:poll` or `:subscribe`
   - `:heartbeat_reconcile_interval_ms` - Full heartbeat cache reconcile interval
+  - `:graceful_shutdown_timeout_ms` - Per-child graceful shutdown timeout (default: 30_000)
+  - `:graceful_shutdown_total_timeout_ms` - Overall graceful shutdown timeout (default: 55_000)
   - `:dead_node_threshold_ms` - Dead node cleanup threshold (default: 300_000)
   - `:crash_threshold_count` - Crashes before permanent crash (default: 5)
   - `:crash_threshold_window_ms` - Crash threshold window (default: 3_600_000)
@@ -685,46 +691,40 @@ defmodule DurableServer.Supervisor do
   end
 
   defp ensure_prefix_unclaimed!(prefix) do
-    deadline = System.monotonic_time(:millisecond) + 1_000
-    await_prefix_release!(prefix, deadline)
-  end
+    prefix_key = {__MODULE__, :prefix, prefix}
 
-  defp await_prefix_release!(prefix, deadline) do
-    case Registry.lookup(DurableServer.PrefixRegistry, prefix) do
-      [] ->
+    case :persistent_term.get(prefix_key, nil) do
+      nil ->
         :ok
 
-      [{pid, existing_name}] ->
-        if Process.alive?(pid) do
+      existing_name ->
+        if Process.whereis(existing_name) != nil do
           raise ArgumentError,
                 "prefix #{inspect(prefix)} is already claimed by supervisor #{inspect(existing_name)}"
-        else
-          if System.monotonic_time(:millisecond) < deadline do
-            Process.sleep(1)
-            await_prefix_release!(prefix, deadline)
-          else
-            raise ArgumentError,
-                  "timed out releasing prefix #{inspect(prefix)} from a stopped owner"
-          end
         end
     end
   end
 
   defp claim_prefix!(prefix, name) do
-    case Registry.register(DurableServer.PrefixRegistry, prefix, name) do
-      {:ok, _owner} ->
+    prefix_key = {__MODULE__, :prefix, prefix}
+
+    case :persistent_term.get(prefix_key, nil) do
+      nil ->
         :ok
 
-      {:error, {:already_registered, owner_pid}} ->
-        existing_name =
-          case Registry.lookup(DurableServer.PrefixRegistry, prefix) do
-            [{^owner_pid, owner_name}] -> owner_name
-            _ -> owner_pid
-          end
+      ^name ->
+        :persistent_term.erase(prefix_key)
 
-        raise ArgumentError,
-              "prefix #{inspect(prefix)} is already claimed by supervisor #{inspect(existing_name)}"
+      existing_name ->
+        if Process.whereis(existing_name) == nil do
+          :persistent_term.erase(prefix_key)
+        else
+          raise ArgumentError,
+                "prefix #{inspect(prefix)} is already claimed by supervisor #{inspect(existing_name)}"
+        end
     end
+
+    :persistent_term.put(prefix_key, name)
   end
 
   @doc false
@@ -3235,6 +3235,7 @@ defmodule DurableServer.Supervisor do
         :heartbeat_tracking_mode,
         :heartbeat_reconcile_interval_ms,
         :graceful_shutdown_timeout_ms,
+        :graceful_shutdown_total_timeout_ms,
         :graceful_shutdown_concurrency,
         :supervisor_shutdown_timeout_ms,
         :dead_node_threshold_ms,
@@ -3483,6 +3484,8 @@ defmodule DurableServer.Supervisor do
       heartbeat_tracking_mode: heartbeat_tracking_mode,
       heartbeat_reconcile_interval_ms: heartbeat_reconcile_interval_ms,
       graceful_shutdown_timeout_ms: Keyword.get(opts, :graceful_shutdown_timeout_ms, 30_000),
+      graceful_shutdown_total_timeout_ms:
+        Keyword.get(opts, :graceful_shutdown_total_timeout_ms, 55_000),
       graceful_shutdown_concurrency: Keyword.get(opts, :graceful_shutdown_concurrency, 50),
       supervisor_shutdown_timeout_ms: Keyword.get(opts, :supervisor_shutdown_timeout_ms, 60_000),
       dead_node_threshold_ms: Keyword.get(opts, :dead_node_threshold_ms, 5 * 60 * 1000),
@@ -3707,13 +3710,13 @@ defmodule DurableServer.Supervisor do
 
   defp warn_on_shutdown_timeout_mismatch(config, backend_resources) do
     supervisor_timeout = config.supervisor_shutdown_timeout_ms
-    graceful_timeout = config.graceful_shutdown_timeout_ms
+    graceful_total_timeout = config.graceful_shutdown_total_timeout_ms
 
-    if supervisor_timeout < graceful_timeout do
+    if supervisor_timeout < graceful_total_timeout do
       Logger.warning(
         "supervisor_shutdown_timeout_ms (#{supervisor_timeout}) is less than " <>
-          "graceful_shutdown_timeout_ms (#{graceful_timeout}); the parent supervisor may cut off " <>
-          "DurableServer shutdown before Terminator finishes draining children"
+          "graceful_shutdown_total_timeout_ms (#{graceful_total_timeout}); the parent supervisor " <>
+          "may cut off DurableServer shutdown before Terminator finishes draining children"
       )
     end
 

@@ -7,9 +7,9 @@
 - Return `{:error, reason}` from `terminate_and_delete_child/2,3` when the storage delete fails instead of `:ok`, and only delete storage after an owned `:deleting` tombstone is CAS-written so a stale process cannot delete an object claimed by a newer owner.
 - Fence crash-time metadata writes to the dying owner so a stale crashing process cannot overwrite a newer owner's status or crash history.
 - Release the storage prefix claim when a supervisor stops or fails to start. Supervisors can now be restarted with the same `:prefix` in the same VM; previously the claim leaked until VM restart.
-- Bound graceful shutdown with one global `graceful_shutdown_timeout_ms` deadline shared by discovery shutdown and all children (previously the timeout applied per child and multiplied across concurrency batches), and warn when children fail final persistence during shutdown.
+- Bound graceful shutdown with a new `graceful_shutdown_total_timeout_ms` deadline (default: `55_000`) shared by discovery shutdown and all children, while preserving `graceful_shutdown_timeout_ms` as each child's persistence window, and warn when children fail final persistence during shutdown.
 - Cap remote placement ERPC calls and remote child timeouts by the caller's remaining deadline instead of issuing fresh fixed per-node timeouts after the budget expired.
-- Retry transient Req heartbeat failures (retryable HTTP statuses, transport timeouts/refusals/closures, HTTP/2 unprocessed) within the heartbeat deadline instead of crashing the supervisor tree on the first error.
+- Enable Req's transient retries for heartbeat writes within the heartbeat deadline instead of crashing the supervisor tree on the first retryable HTTP or transport error.
 - Recover from discovery task crashes by logging, clearing discovery state, and rescheduling instead of restarting the whole supervisor tree.
 - Make mirror fallback promotion create-only (`try_claim`) so promotion can no longer overwrite an object concurrently created in the preferred backend.
 - Retry waiting `ensure_started_child/3` callers immediately when the singleflight leader finishes before the waiter registers instead of sleeping until the full timeout, and never run the guarded operation twice when it raises `ArgumentError`.

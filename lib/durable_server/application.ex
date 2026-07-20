@@ -6,7 +6,6 @@ defmodule DurableServer.Application do
   @impl true
   def start(_type, _args) do
     children = [
-      {Registry, keys: :unique, name: DurableServer.PrefixRegistry},
       {Finch, name: DurableServer.Finch},
       {Task.Supervisor, name: DurableServer.TaskSupervisor}
     ]

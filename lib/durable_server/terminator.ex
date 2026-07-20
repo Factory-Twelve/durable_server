@@ -8,7 +8,7 @@ defmodule DurableServer.Terminator do
 
   1. Sends sync_and_stop messages to DurableServer children (with limited concurrency)
   2. Monitors each child process for DOWN messages
-  3. Waits within one configurable deadline for children to sync and terminate
+  3. Enforces both per-child and overall deadlines for children to sync and terminate
   4. Returns to continue the shutdown process
 
   This ensures that DurableServer processes have an opportunity to persist their
@@ -18,8 +18,10 @@ defmodule DurableServer.Terminator do
   ## Configuration
 
   The Terminator uses the same configuration as its parent DurableServer.Supervisor:
-  - `:graceful_shutdown_timeout_ms` - Maximum total time for coordinated child shutdown
-    (default: 30_000ms)
+  - `:graceful_shutdown_timeout_ms` - Maximum time for each child to persist and stop
+    after its shutdown starts (default: 30_000ms)
+  - `:graceful_shutdown_total_timeout_ms` - Maximum time for discovery shutdown and all
+    child shutdown batches together (default: 55_000ms)
   - `:graceful_shutdown_concurrency` - Maximum concurrent shutdown operations
     (default: 50, should match Finch pool size to avoid connection exhaustion)
 
@@ -29,7 +31,7 @@ defmodule DurableServer.Terminator do
   2. Terminator's terminate/2 is called with reason and state
   3. Terminator uses Task.async_stream with limited concurrency to:
      a. Send {:durable, {:sync_and_stop, reason}} to each DurableServer
-     b. Wait for children within the shared shutdown deadline
+     b. Wait for each child up to its own timeout and within the overall shutdown deadline
   4. Each DurableServer calls sync_state/1 then stops normally
   5. After all children stop or timeout is reached, terminate/2 returns
   6. Supervisor continues shutdown process
@@ -46,6 +48,7 @@ defmodule DurableServer.Terminator do
   require Logger
 
   @graceful_shutdown_timeout_ms 30_000
+  @graceful_shutdown_total_timeout_ms 55_000
   @graceful_shutdown_concurrency 50
 
   def start_link(opts) do
@@ -63,6 +66,12 @@ defmodule DurableServer.Terminator do
       config: config,
       graceful_shutdown_timeout_ms:
         Map.get(config, :graceful_shutdown_timeout_ms, @graceful_shutdown_timeout_ms),
+      graceful_shutdown_total_timeout_ms:
+        Map.get(
+          config,
+          :graceful_shutdown_total_timeout_ms,
+          @graceful_shutdown_total_timeout_ms
+        ),
       graceful_shutdown_concurrency:
         Map.get(config, :graceful_shutdown_concurrency, @graceful_shutdown_concurrency)
     }
@@ -76,7 +85,7 @@ defmodule DurableServer.Terminator do
     )
 
     deadline =
-      System.monotonic_time(:millisecond) + state.graceful_shutdown_timeout_ms
+      System.monotonic_time(:millisecond) + state.graceful_shutdown_total_timeout_ms
 
     case remaining_timeout(deadline) do
       0 ->
@@ -103,9 +112,9 @@ defmodule DurableServer.Terminator do
             "(concurrency: #{state.graceful_shutdown_concurrency})"
         )
 
-        # Use Task.async_stream to limit concurrent shutdown operations.
-        # Every task shares the same deadline so later batches cannot multiply
-        # the configured graceful shutdown timeout.
+        # Use Task.async_stream to limit concurrent shutdown operations. Each child
+        # gets its configured persistence window, capped by the overall deadline so
+        # later batches cannot make shutdown unbounded.
         start_time = System.monotonic_time(:millisecond)
 
         diagnostics_before =
@@ -115,7 +124,7 @@ defmodule DurableServer.Terminator do
           children
           |> Task.async_stream(
             fn {_id, pid, _type, _modules} ->
-              shutdown_child(pid, deadline)
+              shutdown_child(pid, state.graceful_shutdown_timeout_ms, deadline)
             end,
             max_concurrency: state.graceful_shutdown_concurrency,
             timeout: :infinity,
@@ -155,19 +164,28 @@ defmodule DurableServer.Terminator do
     end
   end
 
-  defp shutdown_child(pid, deadline) do
+  defp shutdown_child(pid, per_child_timeout, overall_deadline) do
     ref = Process.monitor(pid)
     send(pid, {:durable, {:sync_and_stop, :shutdown}})
+
+    child_deadline =
+      min(
+        System.monotonic_time(:millisecond) + per_child_timeout,
+        overall_deadline
+      )
 
     receive do
       {:DOWN, ^ref, :process, ^pid, _reason} ->
         :ok
     after
-      remaining_timeout(deadline) ->
-        # The shared budget is exhausted. Kill without adding another per-child wait.
+      remaining_timeout(child_deadline) ->
         Process.exit(pid, :kill)
         Process.demonitor(ref, [:flush])
-        Logger.warning("Child #{inspect(pid)} did not terminate before shutdown deadline, killed")
+
+        Logger.warning(
+          "Child #{inspect(pid)} did not terminate before its graceful shutdown deadline, killed"
+        )
+
         :killed
     end
   end
