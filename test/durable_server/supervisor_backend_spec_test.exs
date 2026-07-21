@@ -110,6 +110,42 @@ defmodule DurableServer.SupervisorBackendSpecTest do
     end
   end
 
+  test "rejects heartbeats beyond the configured future clock-skew tolerance" do
+    supervisor_name = unique_supervisor_name("heartbeat_skew")
+    prefix = unique_prefix("heartbeat_skew")
+
+    start_supervised!(
+      {DurableServer.Supervisor,
+       [
+         name: supervisor_name,
+         prefix: prefix,
+         backend: {InMemoryBackend, name: :heartbeat_skew},
+         heartbeat_future_skew_tolerance_ms: 50,
+         graceful_shutdown_timeout_ms: 500
+       ]}
+    )
+
+    table = :"durable_server_heartbeats_#{supervisor_name}"
+    node_str = "future-heartbeat@host"
+    now = System.system_time(:millisecond)
+
+    :ets.insert(table, {node_str, 1, now + 5_000, nil, nil, %{}, %{}})
+
+    assert :stale =
+             LifecycleManager.lookup_node_health(%{
+               supervisor: supervisor_name,
+               node_str: node_str
+             })
+
+    :ets.insert(table, {node_str, 1, now + 25, nil, nil, %{}, %{}})
+
+    assert {:healthy, %{node_ref: 1}} =
+             LifecycleManager.lookup_node_health(%{
+               supervisor: supervisor_name,
+               node_str: node_str
+             })
+  end
+
   test "accepts backend module spec directly" do
     supervisor_name = unique_supervisor_name("custom")
     prefix = unique_prefix("custom")
@@ -130,6 +166,40 @@ defmodule DurableServer.SupervisorBackendSpecTest do
     assert storage_backend.adapter == InMemoryBackend
     assert storage_backend.state.name == :custom
     assert object_store == nil
+  end
+
+  test "caps placement ERPC timeout by the caller deadline" do
+    supervisor_name = unique_supervisor_name("placement_deadline")
+    prefix = unique_prefix("placement_deadline")
+
+    start_supervised!(
+      {DurableServer.Supervisor,
+       [
+         name: supervisor_name,
+         prefix: prefix,
+         backend: {InMemoryBackend, name: :placement_deadline},
+         placement_erpc_timeout_cross_region_ms: 8_000
+       ]}
+    )
+
+    deadline = System.monotonic_time(:millisecond) + 25
+
+    timeout =
+      DurableServer.Supervisor.__placement_erpc_timeout_ms__(
+        supervisor_name,
+        :remote@host,
+        deadline
+      )
+
+    assert timeout > 0
+    assert timeout <= 25
+
+    assert 0 ==
+             DurableServer.Supervisor.__placement_erpc_timeout_ms__(
+               supervisor_name,
+               :remote@host,
+               System.monotonic_time(:millisecond) - 1
+             )
   end
 
   test "child_spec uses configured supervisor shutdown timeout" do
@@ -350,13 +420,13 @@ defmodule DurableServer.SupervisorBackendSpecTest do
                         log: false,
                         shutdown_barrier: 120_000
                       ]},
-                   graceful_shutdown_timeout_ms: 90_000,
+                   graceful_shutdown_total_timeout_ms: 90_000,
                    supervisor_shutdown_timeout_ms: 60_000
                  )
       end)
 
     assert log =~
-             "supervisor_shutdown_timeout_ms (60000) is less than graceful_shutdown_timeout_ms (90000)"
+             "supervisor_shutdown_timeout_ms (60000) is less than graceful_shutdown_total_timeout_ms (90000)"
 
     assert log =~
              "supervisor_shutdown_timeout_ms (60000) is less than managed EKV shutdown requirement"

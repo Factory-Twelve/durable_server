@@ -139,6 +139,83 @@ defmodule DurableServer.LifecycleTest do
     def decode(_state, data), do: {:ok, data}
   end
 
+  defmodule DiscoveryCrashOnceBackend do
+    @behaviour DurableServer.StorageBackend
+
+    alias DurableServer.StorageBackend
+
+    @impl true
+    def init_backend(opts) do
+      delegate = Keyword.fetch!(opts, :delegate)
+
+      {:ok,
+       %{
+         state: %{
+           delegate: delegate,
+           table: Keyword.fetch!(opts, :table),
+           notify_pid: Keyword.fetch!(opts, :notify_pid)
+         },
+         defaults: StorageBackend.defaults(delegate),
+         features: StorageBackend.features(delegate)
+       }}
+    end
+
+    @impl true
+    def ensure_ready(%{delegate: delegate}), do: StorageBackend.ensure_ready(delegate)
+
+    @impl true
+    def get_object(%{delegate: delegate}, key, opts),
+      do: StorageBackend.get_object(delegate, key, opts)
+
+    @impl true
+    def list_all_objects_stream(
+          %{delegate: delegate, table: table, notify_pid: notify_pid},
+          prefix,
+          opts
+        ) do
+      if String.ends_with?(prefix, "__nodes/") do
+        StorageBackend.list_all_objects_stream(delegate, prefix, opts)
+      else
+        attempt =
+          :ets.update_counter(
+            table,
+            :discovery_list_attempts,
+            {2, 1},
+            {:discovery_list_attempts, 0}
+          )
+
+        send(notify_pid, {:discovery_list_attempt, attempt})
+
+        if attempt == 1 do
+          raise "injected discovery failure"
+        else
+          StorageBackend.list_all_objects_stream(delegate, prefix, opts)
+        end
+      end
+    end
+
+    @impl true
+    def put_object(%{delegate: delegate}, key, data, opts),
+      do: StorageBackend.put_object(delegate, key, data, opts)
+
+    @impl true
+    def delete_object(%{delegate: delegate}, key), do: StorageBackend.delete_object(delegate, key)
+
+    @impl true
+    def try_claim(%{delegate: delegate}, key, body),
+      do: StorageBackend.try_claim(delegate, key, body)
+
+    @impl true
+    def update_object(%{delegate: delegate}, key, update_fn, opts),
+      do: StorageBackend.update_object(delegate, key, update_fn, opts)
+
+    @impl true
+    def encode(%{delegate: delegate}, data), do: StorageBackend.encode(delegate, data)
+
+    @impl true
+    def decode(%{delegate: delegate}, data), do: StorageBackend.decode(delegate, data)
+  end
+
   defmodule HeartbeatDelayBackend do
     @behaviour DurableServer.StorageBackend
 
@@ -1514,20 +1591,11 @@ defmodule DurableServer.LifecycleTest do
       # Manager should still be alive despite corrupted data
       assert_process_alive(manager_pid)
 
-      # Should have attempted to process or clean up corruption
-      {:ok, data} =
-        DurableServer.fetch_stored_state(config.object_store, %{key: key, prefix: prefix})
+      # Corrupt typed fields are rejected as data errors rather than admitted into Meta.
+      assert {:error, %ArgumentError{message: message}} =
+               DurableServer.fetch_stored_state(config.object_store, %{key: key, prefix: prefix})
 
-      # The restart attempt fields should be handled gracefully
-      # Since we started with corrupted string values, they might remain as strings
-      # or be cleaned up entirely. Both are acceptable for corruption recovery.
-      restart_time = Map.get(data.meta, :restart_attempt_time)
-
-      if restart_time do
-        # Either cleaned up and replaced with proper integer, or left as original corrupt string
-        assert is_integer(restart_time) or is_binary(restart_time),
-               "Restart time should be integer (if fixed) or string (if original corrupt data)"
-      end
+      assert message =~ "invalid metadata field :restart_attempt_time"
 
       GenServer.stop(manager_pid)
     end
@@ -2553,6 +2621,40 @@ defmodule DurableServer.LifecycleTest do
       GenServer.stop(manager_pid)
     end
 
+    test "an abnormal discovery task exit is handled and retried", %{
+      supervisor_name: supervisor_name,
+      config: config
+    } do
+      table = :ets.new(__MODULE__.DiscoveryCrashOnceBackend, [:set, :public])
+      delegate = DurableServer.Supervisor.__get_config__(supervisor_name).storage_backend
+
+      {:ok, storage_backend} =
+        DurableServer.StorageBackend.init_backend(DiscoveryCrashOnceBackend,
+          delegate: delegate,
+          table: table,
+          notify_pid: self()
+        )
+
+      test_config =
+        config
+        |> Map.put(:object_store, storage_backend)
+        |> Map.put(:storage_backend, storage_backend)
+        |> Map.put(:initial_discovery_delay_ms, 60_000)
+        |> Map.put(:discovery_interval_ms, 10)
+
+      {:ok, manager_pid} = start_standalone_lifecycle_manager(supervisor_name, test_config)
+      manager_ref = Process.monitor(manager_pid)
+
+      send(manager_pid, :discover_and_restart)
+
+      assert_receive {:discovery_list_attempt, 1}, 1_000
+      assert_receive {:discovery_list_attempt, 2}, 1_000
+      refute_receive {:DOWN, ^manager_ref, :process, ^manager_pid, _reason}, 50
+      assert Process.alive?(manager_pid)
+
+      GenServer.stop(manager_pid)
+    end
+
     test "task supervision completes discovery cycle properly", %{
       supervisor_name: supervisor_name,
       prefix: _prefix,
@@ -2597,8 +2699,12 @@ defmodule DurableServer.LifecycleTest do
       assert [{:heartbeat_write, %{"last_heartbeat_at" => stored_heartbeat_at}}] =
                :ets.lookup(table, :heartbeat_write)
 
-      # Remote stale checks use this stored timestamp, so local self-kill math must too.
+      # The persisted wall timestamp remains available for cross-node freshness checks,
+      # while local deadline arithmetic tracks the equivalent monotonic instant.
       assert abs(manager_state.last_successful_heartbeat_at - stored_heartbeat_at) < 500
+
+      assert System.monotonic_time(:millisecond) -
+               manager_state.last_successful_heartbeat_monotonic_at < 3_000
 
       GenServer.stop(manager_pid)
     end
@@ -2625,7 +2731,7 @@ defmodule DurableServer.LifecycleTest do
       assert [{:attempts, attempts}] = :ets.lookup(table, :attempts)
       assert attempts >= 3
       assert [{:last_put_opts, put_opts}] = :ets.lookup(table, :last_put_opts)
-      assert Keyword.get(put_opts, :max_retries) == 0
+      assert Keyword.get(put_opts, :max_retries) > 0
       assert [{:last_write, heartbeat_data}] = :ets.lookup(table, :last_write)
       assert is_map(heartbeat_data)
       assert Map.has_key?(heartbeat_data, "last_heartbeat_at")
@@ -2709,7 +2815,10 @@ defmodule DurableServer.LifecycleTest do
         {us, result} =
           :timer.tc(fn ->
             LifecycleManager.handle_info(
-              {ref, {:heartbeat, {%{total_ms: 10, put_ms: 5, cache_ms: 5}, heartbeat_entry}}},
+              {ref,
+               {:heartbeat,
+                {%{total_ms: 10, put_ms: 5, cache_ms: 5}, heartbeat_entry,
+                 System.monotonic_time(:millisecond)}}},
               state
             )
           end)

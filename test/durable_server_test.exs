@@ -107,6 +107,10 @@ defmodule DurableServerTest do
     :ets.insert(table, {{:override, key, consistent}, response})
   end
 
+  defp put_backend_delete_override(table, key, response) do
+    :ets.insert(table, {{:delete_override, key}, response})
+  end
+
   defp insert_running_lock(table, storage_key, supervisor_name, prefix, key, pid) do
     node_ref = DurableServer.Supervisor.node_ref(supervisor_name)
 
@@ -323,13 +327,19 @@ defmodule DurableServerTest do
 
     @impl true
     def delete_object(%{table: table}, key) do
-      case :ets.lookup(table, {:data, key}) do
-        [{{:data, ^key}, _value}] ->
-          :ets.delete(table, {:data, key})
-          :ok
+      case :ets.lookup(table, {:delete_override, key}) do
+        [{{:delete_override, ^key}, response}] ->
+          response
 
         [] ->
-          {:error, :not_found}
+          case :ets.lookup(table, {:data, key}) do
+            [{{:data, ^key}, _value}] ->
+              :ets.delete(table, {:data, key})
+              :ok
+
+            [] ->
+              {:error, :not_found}
+          end
       end
     end
 
@@ -500,6 +510,11 @@ defmodule DurableServerTest do
       {:noreply, new_state}
     end
 
+    def handle_cast(:increment_with_timeout, %{count: count} = state) do
+      new_state = %{state | count: count + 1}
+      {:noreply, new_state, 1_000}
+    end
+
     def handle_cast(:increment_and_sync, %{count: count} = state) do
       new_state = %{state | count: count + 1}
       {:noreply, new_state, :sync}
@@ -596,6 +611,18 @@ defmodule DurableServerTest do
     def handle_call(:increment, _from, %{count: count} = state) do
       new_state = %{state | count: count + 1}
       {:reply, count + 1, new_state}
+    end
+  end
+
+  defmodule SlowTerminateServer do
+    use DurableServer, vsn: 1
+
+    def dump_state(state), do: state
+    def load_state(_old_vsn, state), do: DurableServerTest.atomify_keys(state)
+
+    def terminate(_reason, %{terminate_sleep_ms: sleep_ms}) do
+      Process.sleep(sleep_ms)
+      :ok
     end
   end
 
@@ -709,6 +736,56 @@ defmodule DurableServerTest do
   end
 
   describe "init/1" do
+    test "releases its prefix claim when the supervisor stops", %{prefix: _prefix} do
+      unique_id = DurableServer.UUID.uuid4()
+      supervisor_name = :"restartable_supervisor_#{unique_id}"
+      prefix = "restartable_#{unique_id}/"
+      opts = [name: supervisor_name, prefix: prefix, object_store: test_object_store_opts()]
+
+      assert {:ok, first_pid} = DurableServer.Supervisor.start_link(opts)
+
+      assert_raise ArgumentError, ~r/already claimed by supervisor/, fn ->
+        DurableServer.Supervisor.start_link(
+          Keyword.put(opts, :name, :"competing_supervisor_#{unique_id}")
+        )
+      end
+
+      assert :ok = Supervisor.stop(first_pid)
+
+      restarted_opts =
+        Keyword.put(opts, :name, :"restarted_supervisor_#{unique_id}")
+
+      assert {:ok, second_pid} = DurableServer.Supervisor.start_link(restarted_opts)
+      assert :ok = Supervisor.stop(second_pid)
+    end
+
+    test "releases its prefix claim when startup fails", %{prefix: _prefix} do
+      unique_id = DurableServer.UUID.uuid4()
+      supervisor_name = :"failed_restartable_supervisor_#{unique_id}"
+      prefix = "failed_restartable_#{unique_id}/"
+
+      invalid_opts = [
+        name: supervisor_name,
+        prefix: prefix,
+        backend: {ConsistencyProbeBackend, owner: self()},
+        heartbeat_interval_ms: 0
+      ]
+
+      failed_start =
+        Task.async(fn ->
+          Process.flag(:trap_exit, true)
+          DurableServer.Supervisor.start_link(invalid_opts)
+        end)
+
+      assert {:error, _reason} = Task.await(failed_start)
+
+      valid_opts =
+        Keyword.delete(invalid_opts, :heartbeat_interval_ms)
+
+      assert {:ok, supervisor_pid} = DurableServer.Supervisor.start_link(valid_opts)
+      assert :ok = Supervisor.stop(supervisor_pid)
+    end
+
     test "initializes successfully with valid options", %{
       supervisor_name: supervisor_name,
       prefix: _prefix
@@ -845,6 +922,18 @@ defmodule DurableServerTest do
         DurableServer.Supervisor.start_child(
           supervisor_name,
           {TestServer, initial_state: %{custom_opts: %{}}}
+        )
+      end
+    end
+
+    test "rejects child keys in the internal heartbeat namespace", %{
+      supervisor_name: supervisor_name,
+      prefix: _prefix
+    } do
+      assert_raise ArgumentError, ~r/reserved internal namespace/, fn ->
+        DurableServer.Supervisor.start_child(
+          supervisor_name,
+          {TestServer, key: "__nodes/future@host", initial_state: %{}}
         )
       end
     end
@@ -1318,6 +1407,14 @@ defmodule DurableServerTest do
       assert GenServer.call(pid, :get_count) == 1
     end
 
+    test "supports integer timeout actions from call and noreply callbacks", %{pid: pid} do
+      assert GenServer.call(pid, :increment_with_timeout) == 1
+      GenServer.cast(pid, :increment_with_timeout)
+      :sys.get_state(pid)
+      assert GenServer.call(pid, :get_count) == 2
+      refute_process_down(pid)
+    end
+
     test "handles cast messages", %{pid: pid} do
       GenServer.cast(pid, :increment)
       # Allow cast to process
@@ -1672,6 +1769,30 @@ defmodule DurableServerTest do
                state: %{"count" => 1, "key" => ^key},
                vsn: 1
              } = persisted_data
+    end
+
+    test "stops when auto sync loses the storage CAS", %{prefix: _prefix} do
+      {supervisor_name, _supervisor_pid, prefix} =
+        start_test_supervisor(backend: {ConsistencyProbeBackend, owner: self()})
+
+      key = "auto-sync-conflict-#{DurableServer.UUID.uuid4()}"
+
+      {:ok, {pid, _meta}} =
+        DurableServer.Supervisor.start_child(
+          supervisor_name,
+          {AutoSyncServer, key: key, initial_state: %{}}
+        )
+
+      %{storage_backend: backend} = DurableServer.Supervisor.__get_config__(supervisor_name)
+      storage_key = prefix <> key
+      {:ok, %{body: stored_state, etag: etag}} = StorageBackend.get_object(backend, storage_key)
+
+      assert {:ok, _obj} =
+               StorageBackend.put_object(backend, storage_key, stored_state, etag: etag)
+
+      ref = Process.monitor(pid)
+      assert catch_exit(GenServer.call(pid, :increment))
+      assert_receive {:DOWN, ^ref, :process, ^pid, _reason}
     end
 
     test "does not auto sync when disabled", %{supervisor_name: supervisor_name, prefix: prefix} do
@@ -2112,6 +2233,77 @@ defmodule DurableServerTest do
     end
   end
 
+  describe "graceful shutdown" do
+    test "reports final persistence failures", %{prefix: _prefix} do
+      unique_id = DurableServer.UUID.uuid4()
+      supervisor_name = :"shutdown_failure_#{unique_id}"
+      prefix = "shutdown_failure_#{unique_id}/"
+
+      assert {:ok, supervisor_pid} =
+               DurableServer.Supervisor.start_link(
+                 name: supervisor_name,
+                 prefix: prefix,
+                 backend: {ConsistencyProbeBackend, owner: self()}
+               )
+
+      key = "shutdown-sync-failure"
+
+      assert {:ok, {_server_pid, _meta}} =
+               DurableServer.Supervisor.start_child(
+                 supervisor_name,
+                 {TestServer, key: key, initial_state: %{}}
+               )
+
+      %{storage_backend: backend} = DurableServer.Supervisor.__get_config__(supervisor_name)
+      storage_key = prefix <> key
+
+      assert {:ok, %{body: stored_state, etag: etag}} =
+               StorageBackend.get_object(backend, storage_key)
+
+      assert {:ok, _obj} =
+               StorageBackend.put_object(backend, storage_key, stored_state, etag: etag)
+
+      log =
+        capture_log(fn -> assert :ok = Supervisor.stop(supervisor_pid, :normal, :infinity) end)
+
+      assert log =~ "1 DurableServer children failed final persistence during shutdown"
+    end
+
+    test "uses one overall timeout budget across all concurrency batches", %{prefix: _prefix} do
+      unique_id = DurableServer.UUID.uuid4()
+      supervisor_name = :"shutdown_budget_#{unique_id}"
+
+      assert {:ok, supervisor_pid} =
+               DurableServer.Supervisor.start_link(
+                 name: supervisor_name,
+                 prefix: "shutdown_budget_#{unique_id}/",
+                 backend: {ConsistencyProbeBackend, owner: self()},
+                 graceful_shutdown_concurrency: 1,
+                 graceful_shutdown_timeout_ms: 1_000,
+                 graceful_shutdown_total_timeout_ms: 75
+               )
+
+      pids =
+        for index <- 1..4 do
+          key = "slow-shutdown-#{index}-#{DurableServer.UUID.uuid4()}"
+
+          assert {:ok, {pid, _meta}} =
+                   DurableServer.Supervisor.start_child(
+                     supervisor_name,
+                     {SlowTerminateServer, key: key, initial_state: %{terminate_sleep_ms: 1_000}}
+                   )
+
+          pid
+        end
+
+      {elapsed_us, :ok} = :timer.tc(fn -> Supervisor.stop(supervisor_pid, :normal, :infinity) end)
+      elapsed_ms = div(elapsed_us, 1_000)
+
+      assert elapsed_ms < 225
+      assert Enum.all?(pids, &(not Process.alive?(&1)))
+    end
+  end
+
   describe "error handling" do
     test "continues operation when sync operations encounter errors", %{
       supervisor_name: supervisor_name,
@@ -2470,6 +2662,56 @@ defmodule DurableServerTest do
       assert_receive {:DOWN, ^ref, :process, ^blocked_pid, _reason}, 2_000
     end
 
+    test "singleflight waiter retries when the owner finishes before waiter registration", %{
+      supervisor_name: supervisor_name,
+      prefix: _prefix
+    } do
+      singleflight_key =
+        {:ensure_started_child, "registration-race", DurableServerTest.BlockingInitServer}
+
+      owner_registry = :"durable_sf_owner_#{supervisor_name}"
+      waiters_registry = :"durable_sf_waiters_#{supervisor_name}"
+      parent = self()
+
+      owner_pid =
+        spawn(fn ->
+          {:ok, _} = Registry.register(owner_registry, singleflight_key, :singleflight_owner)
+          send(parent, {:singleflight_owner_ready, self()})
+
+          receive do
+            :finish ->
+              Registry.dispatch(waiters_registry, singleflight_key, fn _entries -> :ok end)
+              Registry.unregister(owner_registry, singleflight_key)
+              send(parent, {:singleflight_owner_finished, self()})
+
+              receive do
+                :stop -> :ok
+              end
+          end
+        end)
+
+      assert_receive {:singleflight_owner_ready, ^owner_pid}
+      send(owner_pid, :finish)
+      assert_receive {:singleflight_owner_finished, ^owner_pid}
+      assert Process.alive?(owner_pid)
+
+      waiter_ref = make_ref()
+      reply_alias = :erlang.alias()
+
+      assert :retry =
+               DurableServer.Supervisor.__register_singleflight_waiter__(
+                 owner_registry,
+                 waiters_registry,
+                 singleflight_key,
+                 owner_pid,
+                 {waiter_ref, reply_alias}
+               )
+
+      :erlang.unalias(reply_alias)
+      Registry.unregister(waiters_registry, singleflight_key)
+      send(owner_pid, :stop)
+    end
+
     test "timed out singleflight waiter does not receive late singleflight_done", %{
       supervisor_name: supervisor_name,
       prefix: _prefix
@@ -2660,6 +2902,50 @@ defmodule DurableServerTest do
       store = test_object_store()
       {:ok, data} = DurableServer.fetch_stored_state(store, %{key: key, prefix: prefix})
       assert data.meta.status == :crashed
+    end
+
+    test "a stale crashing process does not mark a newer owner as crashed", %{
+      prefix: _prefix
+    } do
+      {supervisor_name, _supervisor_pid, prefix} =
+        start_test_supervisor(backend: {ConsistencyProbeBackend, owner: self()})
+
+      key = "stale-crash-owner-#{DurableServer.UUID.uuid4()}"
+
+      {:ok, {pid, _meta}} =
+        DurableServer.Supervisor.start_child(
+          supervisor_name,
+          {EdgeCaseTestServer, key: key, initial_state: %{count: 0}}
+        )
+
+      %{storage_backend: backend} = DurableServer.Supervisor.__get_config__(supervisor_name)
+      storage_key = prefix <> key
+
+      assert {:ok, %{body: stored_state, etag: etag}} =
+               StorageBackend.get_object(backend, storage_key)
+
+      newer_owner =
+        stored_state.meta
+        |> Map.put(:pid, self())
+        |> Map.update!(:node_ref, &(&1 + 1))
+        |> Meta.put_status(:running)
+
+      assert {:ok, _obj} =
+               StorageBackend.put_object(
+                 backend,
+                 storage_key,
+                 %{stored_state | meta: newer_owner},
+                 etag: etag
+               )
+
+      ref = Process.monitor(pid)
+      assert catch_exit(GenServer.call(pid, :crash))
+      assert_receive {:DOWN, ^ref, :process, ^pid, _reason}
+
+      assert {:ok, %{body: final_state}} = StorageBackend.get_object(backend, storage_key)
+      assert final_state.meta.pid == self()
+      assert final_state.meta.node_ref == newer_owner.node_ref
+      assert final_state.meta.status == :running
     end
 
     test "abnormal stop reasons mark status as crashed", %{
@@ -3380,6 +3666,10 @@ defmodule DurableServerTest do
       {:stop, {:shutdown, :permanent}, :ok, state}
     end
 
+    def handle_call(:stop_shutdown_normal, _from, state) do
+      {:stop, {:shutdown, :normal}, :ok, state}
+    end
+
     def handle_call(:stop_permanent_non_shutdown, _from, state) do
       {:stop, :permanent, :ok, state}
     end
@@ -3434,6 +3724,77 @@ defmodule DurableServerTest do
 
       # verify terminate was called
       assert_receive {:terminate, _reason, ^key}
+    end
+
+    test "a stale process cannot delete a newer owner's object", %{prefix: _prefix} do
+      {supervisor_name, _supervisor_pid, prefix} =
+        start_test_supervisor(backend: {ConsistencyProbeBackend, owner: self()})
+
+      key = "stale-delete-owner-#{DurableServer.UUID.uuid4()}"
+
+      {:ok, {server_pid, _meta}} =
+        DurableServer.Supervisor.start_child(
+          supervisor_name,
+          {DeleteTestServer, key: key, initial_state: %{}}
+        )
+
+      %{storage_backend: backend} = DurableServer.Supervisor.__get_config__(supervisor_name)
+      storage_key = prefix <> key
+
+      assert {:ok, %{body: stored_state, etag: etag}} =
+               StorageBackend.get_object(backend, storage_key)
+
+      newer_owner =
+        stored_state.meta
+        |> Map.put(:pid, self())
+        |> Map.update!(:node_ref, &(&1 + 1))
+        |> Meta.put_status(:running)
+
+      assert {:ok, _obj} =
+               StorageBackend.put_object(
+                 backend,
+                 storage_key,
+                 %{stored_state | meta: newer_owner},
+                 etag: etag
+               )
+
+      ref = Process.monitor(server_pid)
+      assert :ok = GenServer.call(server_pid, :delete_self)
+      assert_receive {:DOWN, ^ref, :process, ^server_pid, {:shutdown, :delete}}
+
+      assert {:ok, %{body: final_state}} = StorageBackend.get_object(backend, storage_key)
+      assert final_state.meta.pid == self()
+      assert final_state.meta.node_ref == newer_owner.node_ref
+      assert final_state.meta.status == :running
+    end
+
+    test "terminate_and_delete_child returns a storage deletion failure", %{prefix: _prefix} do
+      {supervisor_name, _supervisor_pid, prefix} =
+        start_test_supervisor(backend: {ConsistencyProbeBackend, owner: self()})
+
+      %{storage_backend: backend} = DurableServer.Supervisor.__get_config__(supervisor_name)
+
+      for target <- [:pid, :key] do
+        key = "delete-failure-#{target}-#{DurableServer.UUID.uuid4()}"
+
+        {:ok, {server_pid, _meta}} =
+          DurableServer.Supervisor.start_child(
+            supervisor_name,
+            {DeleteTestServer, key: key, initial_state: %{}}
+          )
+
+        storage_key = prefix <> key
+        put_backend_delete_override(backend_table(backend), storage_key, {:error, :unavailable})
+        delete_target = if target == :pid, do: server_pid, else: key
+
+        assert {:error, :unavailable} =
+                 DurableServer.Supervisor.terminate_and_delete_child(
+                   supervisor_name,
+                   delete_target
+                 )
+
+        assert {:ok, _object} = StorageBackend.get_object(backend, storage_key)
+      end
     end
 
     test "terminate_and_delete_child/2 with key deletes running process and storage", %{
@@ -3747,6 +4108,31 @@ defmodule DurableServerTest do
 
       # verify EXIT signal was :normal (which doesn't kill non-trapping processes)
       assert_receive {:EXIT, ^server_pid, :normal}, 100
+    end
+
+    test "{:stop, {:shutdown, :normal}, state} stops gracefully with the wrapped reason", %{
+      supervisor_name: supervisor_name,
+      prefix: prefix
+    } do
+      key = "normal_shutdown_#{DurableServer.UUID.uuid4()}"
+
+      {:ok, {server_pid, _meta}} =
+        DurableServer.Supervisor.start_child(
+          supervisor_name,
+          {DeleteTestServer, key: key, initial_state: %{}}
+        )
+
+      ref = Process.monitor(server_pid)
+      assert :ok = GenServer.call(server_pid, :stop_shutdown_normal)
+      assert_receive {:DOWN, ^ref, :process, ^server_pid, {:shutdown, :normal}}
+
+      assert {:ok, stored_state} =
+               DurableServer.fetch_stored_state(
+                 DurableServer.Supervisor.__get_config__(supervisor_name).storage_backend,
+                 %{key: key, prefix: prefix}
+               )
+
+      assert stored_state.meta.status == :stopped_graceful
     end
 
     test "{:stop, {:shutdown, :permanent}, state} stops with permanent status and propagates exit",

@@ -34,8 +34,7 @@ defmodule DurableServer.MirrorBackendIntegrationTest do
     def delete_object(%{delegate: delegate}, key), do: StorageBackend.delete_object(delegate, key)
 
     @impl true
-    def try_claim(%{delegate: delegate}, key, body),
-      do: StorageBackend.try_claim(delegate, key, body)
+    def try_claim(_state, _key, _body), do: {:error, :promotion_write_rejected}
 
     @impl true
     def update_object(%{delegate: delegate}, key, update_fn, opts),

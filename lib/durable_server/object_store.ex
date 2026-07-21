@@ -15,6 +15,7 @@ defmodule DurableServer.ObjectStore do
   """
 
   @default_timeout 30_000
+  @max_iam_xml_bytes 1_048_576
 
   @derive {Inspect, only: []}
   defstruct access_key_id: nil,
@@ -257,8 +258,8 @@ defmodule DurableServer.ObjectStore do
         :ok ->
           Logger.info("Successfully created IAM user: #{user_name}")
 
-        {:error, reason} ->
-          Logger.warning("Failed to create IAM user (may already exist): #{inspect(reason)}")
+        {:error, _reason} ->
+          Logger.warning("Failed to create IAM user (it may already exist)")
       end
     end
 
@@ -361,6 +362,41 @@ defmodule DurableServer.ObjectStore do
     end
   end
 
+  @doc false
+  def __parse_iam_xml__(xml_body)
+      when is_binary(xml_body) and byte_size(xml_body) <= @max_iam_xml_bytes do
+    {:ok, SweetXml.parse(xml_body, dtd: :none, quiet: true)}
+  rescue
+    _error -> {:error, :invalid_xml}
+  catch
+    _kind, _reason -> {:error, :invalid_xml}
+  end
+
+  def __parse_iam_xml__(_xml_body), do: {:error, :invalid_xml}
+
+  @doc false
+  def __parse_create_access_key_response__(xml_body, user_name)
+      when is_binary(xml_body) and is_binary(user_name) do
+    with {:ok, xml_document} <- __parse_iam_xml__(xml_body),
+         access_key_id when access_key_id != "" <-
+           xpath(xml_document, ~x"//AccessKeyId/text()"s),
+         secret_access_key when secret_access_key != "" <-
+           xpath(xml_document, ~x"//SecretAccessKey/text()"s) do
+      {:ok,
+       %{
+         access_key_id: access_key_id,
+         secret_access_key: secret_access_key,
+         user_name: user_name
+       }}
+    else
+      {:error, :invalid_xml} ->
+        {:error, {:xml_parse_error, :invalid_xml}}
+
+      _missing_value ->
+        {:error, {:invalid_response, "Missing access key information in response"}}
+    end
+  end
+
   # Creates an IAM user (for LocalStack only)
   defp create_iam_user(client, user_name) do
     Logger.info("Creating IAM user: #{user_name}")
@@ -400,34 +436,15 @@ defmodule DurableServer.ObjectStore do
     }
 
     case iam_request(client, params) do
-      {:ok, %{body: xml_body} = result} ->
-        try do
-          # Parse the XML response manually
-          Logger.debug(fn -> "Received CreateAccessKey response: #{inspect(xml_body)}" end)
+      {:ok, %{body: xml_body}} ->
+        case __parse_create_access_key_response__(xml_body, user_name) do
+          {:ok, _credentials} = ok ->
+            Logger.info("Successfully created access key")
+            ok
 
-          # Extract the access key ID and secret from the XML
-          access_key_id = xml_body |> xpath(~x"//AccessKeyId/text()"s)
-          secret_access_key = xml_body |> xpath(~x"//SecretAccessKey/text()"s)
-
-          if access_key_id != "" and secret_access_key != "" do
-            Logger.info("Successfully created access key with ID: #{access_key_id}")
-
-            {:ok,
-             %{
-               access_key_id: access_key_id,
-               secret_access_key: secret_access_key,
-               user_name: user_name
-             }}
-          else
-            {:error, {:invalid_response, "Missing access key information in response"}}
-          end
-        rescue
-          error ->
-            Logger.error(
-              "Failed to parse CreateAccessKey XML response: #{inspect(error)} #{inspect(result)}"
-            )
-
-            {:error, {:xml_parse_error, error}}
+          {:error, reason} = error ->
+            Logger.error("Failed to parse CreateAccessKey XML response: #{inspect(reason)}")
+            error
         end
 
       {:error, reason} ->
@@ -449,16 +466,20 @@ defmodule DurableServer.ObjectStore do
     case iam_request(client, params) do
       {:ok, %{body: xml_body}} when is_binary(xml_body) and xml_body != "" ->
         # Parse the XML response manually
-        Logger.debug(
-          "Received CreatePolicy response: #{inspect(String.slice(xml_body, 0, 100))}..."
-        )
+        Logger.debug("Received CreatePolicy response")
 
         try do
+          xml_document =
+            case __parse_iam_xml__(xml_body) do
+              {:ok, document} -> document
+              {:error, :invalid_xml} -> raise ArgumentError, "invalid IAM XML response"
+            end
+
           # Extract the policy ARN from the XML
-          policy_arn = xml_body |> xpath(~x"//Arn/text()"s)
+          policy_arn = xml_document |> xpath(~x"//Arn/text()"s)
 
           if policy_arn != "" do
-            Logger.info("Successfully created policy with ARN: #{policy_arn}")
+            Logger.info("Successfully created IAM policy")
             {:ok, %{policy_arn: policy_arn}}
           else
             {:error, {:invalid_response, "Missing policy ARN in response"}}
@@ -466,14 +487,14 @@ defmodule DurableServer.ObjectStore do
         catch
           kind, reason ->
             Logger.error(
-              "Failed to parse CreatePolicy XML response: #{inspect(kind: kind, reason: reason, body: xml_body)}"
+              "Failed to parse CreatePolicy XML response: #{inspect(kind: kind, reason: reason)}"
             )
 
             {:error, {:xml_parse_error, {kind, reason}}}
         end
 
-      {:ok, %{body: xml_body}} ->
-        Logger.error("CreatePolicy returned empty or invalid body: #{inspect(xml_body)}")
+      {:ok, %{body: _xml_body}} ->
+        Logger.error("CreatePolicy returned an empty or invalid body")
         {:error, {:invalid_response, "Empty or invalid response body"}}
 
       {:error, reason} ->
@@ -483,7 +504,7 @@ defmodule DurableServer.ObjectStore do
 
   # Attaches a policy to a user (access key) using the AttachUserPolicy API operation via Req
   defp attach_user_policy(client, user_name, policy_arn) do
-    Logger.info("Attaching policy #{policy_arn} to user: #{user_name}")
+    Logger.info("Attaching IAM policy to user")
 
     params = %{
       "Action" => "AttachUserPolicy",
@@ -500,7 +521,7 @@ defmodule DurableServer.ObjectStore do
 
   # Deletes an access key using the DeleteAccessKey API operation
   defp delete_access_key(client, access_key_id) do
-    Logger.info("Deleting access key: #{access_key_id}")
+    Logger.info("Deleting access key")
 
     params = %{
       "Action" => "DeleteAccessKey",
@@ -518,7 +539,7 @@ defmodule DurableServer.ObjectStore do
 
   # Deletes a policy using the DeletePolicy API operation
   defp delete_policy(client, policy_arn) do
-    Logger.info("Deleting policy: #{policy_arn}")
+    Logger.info("Deleting IAM policy")
 
     # First detach the policy from the user
     detach_result = detach_user_policy(client, policy_arn)
@@ -537,8 +558,8 @@ defmodule DurableServer.ObjectStore do
   end
 
   # Detaches a policy from all users that it's attached to
-  defp detach_user_policy(_config, policy_arn) do
-    Logger.info("Detaching policy: #{policy_arn} from users")
+  defp detach_user_policy(_config, _policy_arn) do
+    Logger.info("Detaching IAM policy from users")
 
     # We would need to list all users the policy is attached to
     # For simplicity, we'll just return success for now
@@ -573,20 +594,26 @@ defmodule DurableServer.ObjectStore do
 
     case iam_request(client, params) do
       {:ok, %{body: xml_body}} ->
-        policies =
-          xml_body
-          |> xpath(~x"//Policies/member"l)
-          |> Enum.map(fn policy ->
-            %{
-              arn: xpath(policy, ~x"./Arn/text()"s),
-              name: xpath(policy, ~x"./PolicyName/text()"s)
-            }
-          end)
-          |> Enum.filter(fn policy ->
-            String.contains?(policy.name, policy_prefix)
-          end)
+        case __parse_iam_xml__(xml_body) do
+          {:ok, xml_document} ->
+            policies =
+              xml_document
+              |> xpath(~x"//Policies/member"l)
+              |> Enum.map(fn policy ->
+                %{
+                  arn: xpath(policy, ~x"./Arn/text()"s),
+                  name: xpath(policy, ~x"./PolicyName/text()"s)
+                }
+              end)
+              |> Enum.filter(fn policy ->
+                String.contains?(policy.name, policy_prefix)
+              end)
 
-        {:ok, policies}
+            {:ok, policies}
+
+          {:error, :invalid_xml} ->
+            {:error, {:xml_parse_error, :invalid_xml}}
+        end
 
       {:error, reason} ->
         {:error, reason}
@@ -617,16 +644,18 @@ defmodule DurableServer.ObjectStore do
     }
 
     with {:ok, %{body: policy_xml}} <- iam_request(client, get_policy_params),
-         policy_name = policy_xml |> xpath(~x"//PolicyName/text()"s),
-         default_version = policy_xml |> xpath(~x"//DefaultVersionId/text()"s),
+         {:ok, policy_document} <- __parse_iam_xml__(policy_xml),
+         policy_name = policy_document |> xpath(~x"//PolicyName/text()"s),
+         default_version = policy_document |> xpath(~x"//DefaultVersionId/text()"s),
          get_version_params = %{
            "Action" => "GetPolicyVersion",
            "Version" => "2010-05-08",
            "PolicyArn" => policy_arn,
            "VersionId" => default_version
          },
-         {:ok, %{body: version_xml}} <- iam_request(client, get_version_params) do
-      encoded_document = version_xml |> xpath(~x"//Document/text()"s)
+         {:ok, %{body: version_xml}} <- iam_request(client, get_version_params),
+         {:ok, version_document} <- __parse_iam_xml__(version_xml) do
+      encoded_document = version_document |> xpath(~x"//Document/text()"s)
       document = URI.decode(encoded_document)
 
       {:ok,
@@ -891,7 +920,7 @@ defmodule DurableServer.ObjectStore do
       case timeout do
         nil -> nil
         :infinity -> nil
-        ms when is_integer(ms) -> System.system_time(:millisecond) + ms
+        ms when is_integer(ms) -> System.monotonic_time(:millisecond) + ms
       end
 
     # Add If-Match header for etag verification
@@ -919,19 +948,19 @@ defmodule DurableServer.ObjectStore do
           Req.merge(req,
             max_retries: retries,
             retry: fn
-              # don't retry good response, conflict, or not found
-              # 404 on PUT with if-match means object doesn't exist (localstack behavior)
               %Req.Request{}, %Req.Response{status: status}
-              when status in 200..299 or status in [404, 409, 412] ->
-                false
+              when status in [408, 429, 500, 502, 503, 504] ->
+                within_retry_deadline?(deadline_at)
 
-              # check deadline before retrying transient errors
-              %Req.Request{}, _exception ->
-                if deadline_at && System.system_time(:millisecond) >= deadline_at do
-                  false
-                else
-                  true
-                end
+              %Req.Request{}, %Req.TransportError{reason: reason}
+              when reason in [:timeout, :econnrefused, :closed] ->
+                within_retry_deadline?(deadline_at)
+
+              %Req.Request{}, %Req.HTTPError{protocol: :http2, reason: :unprocessed} ->
+                within_retry_deadline?(deadline_at)
+
+              %Req.Request{}, _response_or_exception ->
+                false
             end
           )
 
@@ -956,6 +985,12 @@ defmodule DurableServer.ObjectStore do
         Logger.error("Failed to put object with etag: #{inspect(key: key, error: reason)}")
         {:error, reason}
     end
+  end
+
+  defp within_retry_deadline?(nil), do: true
+
+  defp within_retry_deadline?(deadline_at) do
+    System.monotonic_time(:millisecond) < deadline_at
   end
 
   defp parse_etag!(%{} = headers_or_attrs) do

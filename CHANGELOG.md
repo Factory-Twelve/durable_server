@@ -1,3 +1,23 @@
+## 0.1.5 (unreleased)
+- Add `:heartbeat_future_skew_tolerance_ms` supervisor option (default: `5_000`). Node heartbeats stamped further than this into the future are ignored for liveness decisions instead of being treated as always-fresh, and local heartbeat/watchdog deadlines now use monotonic time so wall-clock (NTP) adjustments no longer stretch or shrink safety windows.
+- Reject child keys in the reserved internal `__nodes/` namespace: `start_child/3`, `ensure_started_child/3`, and `rehome_child/3` now raise `ArgumentError` for keys that would collide with node heartbeat storage.
+- Enforce `max_children` limits atomically with local capacity reservations so concurrent starts can no longer exceed total or per-module limits. Integer `max_children` is enforced through the same path and returns `{:error, {:capacity_limit, :max_children_total}}` instead of leaking DynamicSupervisor's raw `{:error, :max_children}`; integer values must now be positive (`0` or negative raises `ArgumentError`).
+- Terminate servers using `auto_sync: true` when a storage CAS conflict shows the object was replaced by another owner, matching explicit and periodic sync behavior. Previously the stale process logged the conflict and kept serving requests.
+- Accept documented callback returns that previously crashed the process: integer timeout actions (e.g. `{:reply, reply, state, 5_000}`) and `{:stop, {:shutdown, :normal}, ...}` stops, which persist `:stopped_graceful` while preserving the exit reason.
+- Return `{:error, reason}` from `terminate_and_delete_child/2,3` when the storage delete fails instead of `:ok`, and only delete storage after an owned `:deleting` tombstone is CAS-written so a stale process cannot delete an object claimed by a newer owner.
+- Fence crash-time metadata writes to the dying owner so a stale crashing process cannot overwrite a newer owner's status or crash history.
+- Release the storage prefix claim when a supervisor stops or fails to start. Supervisors can now be restarted with the same `:prefix` in the same VM; previously the claim leaked until VM restart.
+- Bound graceful shutdown with a new `graceful_shutdown_total_timeout_ms` deadline (default: `55_000`) shared by discovery shutdown and all children, while preserving `graceful_shutdown_timeout_ms` as each child's persistence window, and warn when children fail final persistence during shutdown.
+- Cap remote placement ERPC calls and remote child timeouts by the caller's remaining deadline instead of issuing fresh fixed per-node timeouts after the budget expired.
+- Enable Req's transient retries for heartbeat writes within the heartbeat deadline instead of crashing the supervisor tree on the first retryable HTTP or transport error.
+- Recover from discovery task crashes by logging, clearing discovery state, and rescheduling instead of restarting the whole supervisor tree.
+- Make mirror fallback promotion create-only (`try_claim`) so promotion can no longer overwrite an object concurrently created in the preferred backend.
+- Retry waiting `ensure_started_child/3` callers immediately when the singleflight leader finishes before the waiter registers instead of sleeping until the full timeout, and never run the guarded operation twice when it raises `ArgumentError`.
+- Harden persisted metadata decoding with bounded sizes, `:safe` external-term decoding, and per-field validation. Corrupt or unsafe metadata is rejected with `{:error, %ArgumentError{}}` from storage reads instead of being admitted as partially typed data; legacy binary node references remain accepted.
+- Parse IAM XML responses with DTDs disabled and a 1 MiB limit to prevent external-entity and entity-expansion attacks from a malicious endpoint.
+- Redact secrets from logging: IAM CreateAccessKey bodies (which contain `SecretAccessKey`) are no longer logged, supervisor startup logs omit backend state and `init_info`, and backend errors no longer echo raw options.
+- Update Mint to 1.9.3 for the HTTP/1 chunk-size parser security fix (CVE-2026-59249).
+
 ## 0.1.4 (2026-06-04)
 - Reject explicit local `start_child/3` and `ensure_started_child/3` attempts before spawning a child when the local supervisor is draining.
 

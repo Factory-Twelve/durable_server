@@ -817,6 +817,8 @@ defmodule DurableServer do
             permanent: false,
             was_permanently_crashed: false,
             user_initiated_stop: nil,
+            delete_request_ref: nil,
+            delete_requester_pid: nil,
             start_time: nil,
             restart_attempt_node: nil,
             restart_attempt_time: nil,
@@ -838,6 +840,10 @@ defmodule DurableServer do
   @max_crash_reason_length 500
   @max_sync_retries 5
   @bootstrap_continue {@durable, :bootstrap}
+
+  defguardp is_callback_action(action)
+            when is_atom(action) or is_tuple(action) or
+                   (is_integer(action) and action >= 0)
 
   defmacro __using__(opts) do
     vsn =
@@ -1376,6 +1382,9 @@ defmodule DurableServer do
 
           {:error, :timeout} ->
             delete_with_lock_attempt(key, timeout, config)
+
+          {:error, _reason} = error ->
+            error
         end
 
       nil ->
@@ -1426,30 +1435,49 @@ defmodule DurableServer do
   end
 
   defp delete_by_pid(pid, timeout) when is_pid(pid) and is_integer(timeout) do
-    start_time = System.system_time(:millisecond)
+    deadline = System.monotonic_time(:millisecond) + timeout
     ref = make_ref()
     monitor_ref = Process.monitor(pid)
     send(pid, {@durable, {:delete_request, ref, self()}})
 
-    receive do
-      # process is shutting down and attempting to delete itself
-      {:delete_in_progress, ^ref} ->
-        Logger.info("Process #{inspect(pid)} completed self-deletion")
-        remaining_timeout = timeout - (System.system_time(:millisecond) - start_time)
+    try do
+      receive do
+        {:delete_in_progress, ^ref} ->
+          await_delete_completion(pid, ref, monitor_ref, deadline)
 
-        # await shutdown
+        # process is dead and did not process our delete request
+        {:DOWN, ^monitor_ref, :process, ^pid, _reason} ->
+          {:error, :noproc}
+      after
+        remaining_delete_timeout(deadline) -> {:error, :timeout}
+      end
+    after
+      Process.demonitor(monitor_ref, [:flush])
+    end
+  end
+
+  defp await_delete_completion(pid, ref, monitor_ref, deadline) do
+    receive do
+      {:delete_complete, ^ref, result} ->
         receive do
-          {:DOWN, ^monitor_ref, :process, ^pid, _} -> :ok
+          {:DOWN, ^monitor_ref, :process, ^pid, _reason} -> result
         after
-          remaining_timeout -> {:error, :timeout}
+          remaining_delete_timeout(deadline) -> {:error, :timeout}
         end
 
-      # process is dead and did not process our delete request
-      {:DOWN, ^monitor_ref, :process, ^pid, _} ->
-        {:error, :noproc}
+      {:DOWN, ^monitor_ref, :process, ^pid, reason} ->
+        receive do
+          {:delete_complete, ^ref, result} -> result
+        after
+          0 -> {:error, {:delete_not_completed, reason}}
+        end
     after
-      timeout -> {:error, :timeout}
+      remaining_delete_timeout(deadline) -> {:error, :timeout}
     end
+  end
+
+  defp remaining_delete_timeout(deadline) do
+    max(deadline - System.monotonic_time(:millisecond), 0)
   end
 
   @doc false
@@ -1654,9 +1682,7 @@ defmodule DurableServer do
         {:noreply, schedule_sync(new_state)}
 
       {:error, :conflict} ->
-        fatal_exit!(
-          "#{state.key} object updated out from underneath: #{inspect(node: node(), pid: self())}"
-        )
+        fatal_sync_conflict!(state)
 
       {:error, reason} ->
         # continue without stopping for transient errors (ie timeouts), but log the error
@@ -1689,7 +1715,13 @@ defmodule DurableServer do
 
     # Defer status persistence to terminate/2 after user callback terminate/2 has run.
     updated_state =
-      %{state | user_initiated_stop: {:shutdown, :delete}, final_status_set: :deleting}
+      %{
+        state
+        | user_initiated_stop: {:shutdown, :delete},
+          final_status_set: :deleting,
+          delete_request_ref: ref,
+          delete_requester_pid: requester_pid
+      }
 
     # stop with delete reason to trigger deletion in terminate/2
     {:stop, {:shutdown, :delete}, updated_state}
@@ -1738,8 +1770,20 @@ defmodule DurableServer do
           handle_user_initiated_terminate(user_stop, reason, state)
       end
 
+    notify_delete_result(state, sync_result)
     maybe_invoke_after_terminate(state, terminate_return, reason, final_status, sync_result)
   end
+
+  defp notify_delete_result(
+         %DurableServer{delete_request_ref: ref, delete_requester_pid: requester_pid},
+         result
+       )
+       when is_reference(ref) and is_pid(requester_pid) do
+    send(requester_pid, {:delete_complete, ref, result})
+    :ok
+  end
+
+  defp notify_delete_result(%DurableServer{}, _result), do: :ok
 
   defp bootstrap_init(
          %DurableServer{
@@ -1764,7 +1808,12 @@ defmodule DurableServer do
          }
        ) do
     with :ok <- maybe_check_global_lock_circuit_breaker(circuit_breaker, preloaded_boot),
-         :ok <- LifecycleManager.check_capacity(supervisor_name, module, capacity_opts) do
+         :ok <-
+           LifecycleManager.check_capacity(
+             supervisor_name,
+             module,
+             Keyword.put(capacity_opts, :skip_count_limits, true)
+           ) do
       current_node_str = to_string(Node.self())
 
       load_result =
@@ -1943,18 +1992,30 @@ defmodule DurableServer do
         Logger.info("DurableServer #{state.key} terminating for deletion - removing from storage")
 
         final_status = state.final_status_set || :deleting
-        sync_result = maybe_sync_final_status(state, final_status)
 
-        case StorageBackend.delete_object(state.object_store, storage_key(state)) do
-          :ok ->
-            Logger.info("Successfully deleted storage for #{state.key}")
+        sync_result =
+          case persist_final_status(state, final_status) do
+            {:ok, %DurableServer{} = synced_state} ->
+              case StorageBackend.delete_object(
+                     synced_state.object_store,
+                     storage_key(synced_state)
+                   ) do
+                :ok ->
+                  Logger.info("Successfully deleted storage for #{state.key}")
+                  :ok
 
-          {:error, :not_found} ->
-            Logger.info("Storage already deleted for #{state.key}")
+                {:error, :not_found} ->
+                  Logger.info("Storage already deleted for #{state.key}")
+                  :ok
 
-          {:error, reason} ->
-            Logger.error("Failed to delete storage for #{state.key}: #{inspect(reason)}")
-        end
+                {:error, reason} ->
+                  Logger.error("Failed to delete storage for #{state.key}: #{inspect(reason)}")
+                  {:error, reason}
+              end
+
+            {:error, _reason} = error ->
+              error
+          end
 
         {final_status, sync_result}
 
@@ -2080,15 +2141,22 @@ defmodule DurableServer do
   end
 
   defp maybe_sync_final_status(%DurableServer{} = state, status) when is_atom(status) do
+    case persist_final_status(state, status) do
+      {:ok, %DurableServer{}} -> :ok
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp persist_final_status(%DurableServer{} = state, status) when is_atom(status) do
     report_sync_and_stop = state.terminator_handled and status == :stopped_graceful
 
     case sync_to_storage(state, meta: %{status: status}) do
-      {:ok, %DurableServer{} = _new_state} ->
+      {:ok, %DurableServer{} = new_state} ->
         if report_sync_and_stop do
           LifecycleManager.report_diagnostic(state.supervisor, :sync_and_stop_ok)
         end
 
-        :ok
+        {:ok, new_state}
 
       {:error, sync_reason} ->
         if report_sync_and_stop do
@@ -2316,7 +2384,7 @@ defmodule DurableServer do
 
       # Handle action + options tuple.
       {:reply, reply, new_user_state, action, opts}
-      when (is_atom(action) or is_tuple(action)) and is_list(opts) ->
+      when is_callback_action(action) and is_list(opts) ->
         {updated_state, sync?} = apply_callback_options(state, opts)
 
         {final_state, final_action} = handle_action(updated_state, new_user_state, action)
@@ -2338,7 +2406,7 @@ defmodule DurableServer do
 
         {:reply, reply, new_state}
 
-      {:reply, reply, new_user_state, action} when is_atom(action) or is_tuple(action) ->
+      {:reply, reply, new_user_state, action} when is_callback_action(action) ->
         {final_state, final_action} = handle_action(state, new_user_state, action)
 
         if final_action do
@@ -2354,7 +2422,7 @@ defmodule DurableServer do
          |> auto_sync_to_storage()}
 
       {:noreply, new_user_state, action, opts}
-      when (is_atom(action) or is_tuple(action)) and is_list(opts) ->
+      when is_callback_action(action) and is_list(opts) ->
         {updated_state, sync?} = apply_callback_options(state, opts)
 
         {final_state, final_action} = handle_action(updated_state, new_user_state, action)
@@ -2376,7 +2444,7 @@ defmodule DurableServer do
 
         {:noreply, new_state}
 
-      {:noreply, new_user_state, action} when is_atom(action) or is_tuple(action) ->
+      {:noreply, new_user_state, action} when is_callback_action(action) ->
         {final_state, final_action} = handle_action(state, new_user_state, action)
 
         if final_action do
@@ -2424,6 +2492,32 @@ defmodule DurableServer do
           )
 
         {:stop, :normal, stopped_state}
+
+      {:stop, {:shutdown, :normal}, reply, new_user_state} ->
+        stopped_state =
+          update_state(
+            %{
+              state
+              | user_initiated_stop: {:shutdown, :normal},
+                final_status_set: :stopped_graceful
+            },
+            new_user_state
+          )
+
+        {:stop, {:shutdown, :normal}, reply, stopped_state}
+
+      {:stop, {:shutdown, :normal}, new_user_state} ->
+        stopped_state =
+          update_state(
+            %{
+              state
+              | user_initiated_stop: {:shutdown, :normal},
+                final_status_set: :stopped_graceful
+            },
+            new_user_state
+          )
+
+        {:stop, {:shutdown, :normal}, stopped_state}
 
       {:stop, {:shutdown, :permanent}, reply, new_user_state} ->
         # shutdown-wrapped permanent stop
@@ -2604,9 +2698,7 @@ defmodule DurableServer do
         synced_state
 
       {:error, :conflict} ->
-        fatal_exit!(
-          "#{state.key} object updated out from underneath: #{inspect(node: node(), pid: self())}"
-        )
+        fatal_sync_conflict!(state)
 
       {:error, reason} ->
         if is_map(metadata) do
@@ -2639,6 +2731,9 @@ defmodule DurableServer do
         {:ok, %DurableServer{} = new_state} ->
           new_state
 
+        {:error, :conflict} ->
+          fatal_sync_conflict!(state)
+
         {:error, reason} ->
           Logger.error(fn ->
             "#{inspect(module)} (key=#{key}) unable to auto_sync: #{inspect(reason)}"
@@ -2649,6 +2744,12 @@ defmodule DurableServer do
     else
       state
     end
+  end
+
+  defp fatal_sync_conflict!(%DurableServer{} = state) do
+    fatal_exit!(
+      "#{state.key} object updated out from underneath: #{inspect(node: node(), pid: self())}"
+    )
   end
 
   defp sync_to_storage(%DurableServer{} = state, opts \\ []) do
@@ -3174,15 +3275,19 @@ defmodule DurableServer do
     store = state.object_store
 
     case StorageBackend.get_object(store, storage_key, consistent: true) do
-      {:ok, %{body: %StoredState{} = stored_state, etag: etag}} ->
-        updated_data =
-          stored_state
-          |> attach_stored_state_context(%{key: state.key, prefix: state.prefix})
-          |> Map.put(:meta, updated_meta)
+      {:ok, %{body: %StoredState{meta: %Meta{} = current_meta} = stored_state, etag: etag}} ->
+        if same_boot_owner?(state, current_meta) do
+          updated_data =
+            stored_state
+            |> attach_stored_state_context(%{key: state.key, prefix: state.prefix})
+            |> Map.put(:meta, updated_meta)
 
-        case put_object(%{state | etag: etag}, storage_key, updated_data) do
-          {:ok, %DurableServer{} = new_state} -> {:ok, new_state}
-          {:error, reason} -> {:error, reason}
+          case put_object(%{state | etag: etag}, storage_key, updated_data) do
+            {:ok, %DurableServer{} = new_state} -> {:ok, new_state}
+            {:error, reason} -> {:error, reason}
+          end
+        else
+          {:error, :ownership_mismatch}
         end
 
       {:ok, %{body: other}} ->

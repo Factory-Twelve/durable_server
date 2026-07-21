@@ -31,6 +31,9 @@ defmodule DurableServer.Meta do
   @permanently_crashed :permanently_crashed
   @deleting :deleting
 
+  @max_metadata_binary_bytes 65_536
+  @max_metadata_base64_bytes div(@max_metadata_binary_bytes + 2, 3) * 4
+
   @statuses [
     @stopped_graceful,
     @stopped_permanent,
@@ -40,13 +43,55 @@ defmodule DurableServer.Meta do
     @deleting
   ]
 
-  # note we are using struct! so keys cannot be removed (but can be added)
-  # if we remove keys we need to change the decode function to pluck out valid keys
   def decode_from_binary(meta_str, %{key: key, prefix: prefix}) when is_binary(meta_str) do
-    meta_str
-    |> Base.decode64!()
-    |> :erlang.binary_to_term()
-    |> from_storage_term(%{key: key, prefix: prefix})
+    with :ok <- validate_encoded_size(meta_str),
+         {:ok, binary} <- decode_base64(meta_str),
+         :ok <- validate_binary_format(binary),
+         {:ok, term} <- decode_safe_term(binary) do
+      from_storage_term(term, %{key: key, prefix: prefix})
+    else
+      {:error, reason} ->
+        raise ArgumentError, to_string(reason)
+    end
+  rescue
+    error in ArgumentError ->
+      raise ArgumentError, "invalid persisted metadata: #{Exception.message(error)}"
+  end
+
+  defp validate_encoded_size(meta_str) do
+    if byte_size(meta_str) <= @max_metadata_base64_bytes do
+      :ok
+    else
+      {:error, "encoded value exceeds #{@max_metadata_binary_bytes} byte limit"}
+    end
+  end
+
+  defp decode_base64(meta_str) do
+    case Base.decode64(meta_str) do
+      {:ok, binary} -> {:ok, binary}
+      :error -> {:error, "invalid base64"}
+    end
+  end
+
+  # This encoder has never emitted compressed ETF. Rejecting it prevents a tiny
+  # persisted value from expanding without a useful pre-decode size bound.
+  defp validate_binary_format(<<131, 80, _compressed_size::32, _rest::binary>>),
+    do: {:error, "compressed external terms are not accepted"}
+
+  defp validate_binary_format(<<131, _rest::binary>> = binary) do
+    if byte_size(binary) <= @max_metadata_binary_bytes do
+      :ok
+    else
+      {:error, "decoded value exceeds #{@max_metadata_binary_bytes} byte limit"}
+    end
+  end
+
+  defp validate_binary_format(_binary), do: {:error, "invalid external term"}
+
+  defp decode_safe_term(binary) do
+    {:ok, :erlang.binary_to_term(binary, [:safe])}
+  rescue
+    _error -> {:error, "unsafe or malformed external term"}
   end
 
   def encode_to_binary(%Meta{} = meta) do
@@ -56,20 +101,125 @@ defmodule DurableServer.Meta do
     |> Base.encode64()
   end
 
-  def from_storage_term(%Meta{} = meta, %{key: key, prefix: prefix}) do
-    %{meta | key: key, prefix: prefix}
+  def from_storage_term(%Meta{} = meta, context) do
+    meta
+    |> Map.from_struct()
+    |> from_storage_term(context)
   end
 
   def from_storage_term(meta_map, %{key: key, prefix: prefix}) when is_map(meta_map) do
-    valid_keys = Map.keys(%__MODULE__{})
-    meta_map = Map.take(meta_map, valid_keys)
-
-    unless Map.has_key?(meta_map, :status) do
-      raise ArgumentError, "invalid meta storage term: #{inspect(meta_map)}"
+    unless safe_metadata_term?(meta_map) do
+      raise ArgumentError, "metadata contains unsupported external terms"
     end
 
+    valid_keys = Map.keys(Map.from_struct(%Meta{}))
+    meta_map = Map.take(meta_map, valid_keys)
+    validate_storage_term!(meta_map)
     %{struct!(Meta, meta_map) | key: key, prefix: prefix}
   end
+
+  def from_storage_term(_term, _context) do
+    raise ArgumentError, "invalid meta storage term"
+  end
+
+  defp validate_storage_term!(meta) do
+    unless Map.has_key?(meta, :status) do
+      raise ArgumentError, "metadata is missing required field :status"
+    end
+
+    validate_field!(meta, :vsn, &(is_integer(&1) and &1 > 0), "a positive integer")
+    validate_field!(meta, :module, &is_atom/1, "an atom")
+    validate_field!(meta, :permanent, &is_boolean/1, "a boolean")
+    validate_field!(meta, :pid, &(is_nil(&1) or is_pid(&1)), "a pid or nil")
+    validate_field!(meta, :status, &(&1 in @statuses), "a supported status")
+    validate_field!(meta, :sticky_placement, &(is_nil(&1) or is_list(&1)), "a list or nil")
+    validate_field!(meta, :sticky_placement_history, &is_list/1, "a list")
+    validate_field!(meta, :supervisor, &(is_nil(&1) or is_atom(&1)), "an atom or nil")
+    validate_field!(meta, :task_supervisor, &(is_nil(&1) or is_atom(&1)), "an atom or nil")
+    validate_field!(meta, :dynamic_supervisor, &(is_nil(&1) or is_atom(&1)), "an atom or nil")
+
+    validate_field!(
+      meta,
+      :node_ref,
+      &(is_nil(&1) or is_integer(&1) or is_binary(&1)),
+      "an integer, binary, or nil"
+    )
+
+    validate_field!(meta, :node_str, &(is_nil(&1) or is_binary(&1)), "a binary or nil")
+
+    validate_field!(
+      meta,
+      :last_heartbeat_at,
+      &(is_nil(&1) or is_integer(&1)),
+      "an integer or nil"
+    )
+
+    validate_field!(meta, :crash_history, &is_list/1, "a list")
+
+    validate_field!(
+      meta,
+      :restart_attempt_node,
+      &(is_nil(&1) or is_binary(&1)),
+      "a binary or nil"
+    )
+
+    validate_field!(
+      meta,
+      :restart_attempt_time,
+      &(is_nil(&1) or is_integer(&1)),
+      "an integer or nil"
+    )
+
+    validate_field!(
+      meta,
+      :restart_attempt_ttl,
+      &(is_nil(&1) or is_integer(&1)),
+      "an integer or nil"
+    )
+
+    validate_field!(
+      meta,
+      :init_from_ref,
+      &(is_nil(&1) or is_reference(&1)),
+      "a reference or nil"
+    )
+
+    validate_field!(
+      meta,
+      :init_from_pid,
+      &(is_nil(&1) or is_pid(&1)),
+      "a pid or nil"
+    )
+
+    :ok
+  end
+
+  defp validate_field!(meta, key, predicate, expected) do
+    value = Map.get(meta, key, Map.fetch!(Map.from_struct(%Meta{}), key))
+
+    unless predicate.(value) do
+      raise ArgumentError, "invalid metadata field #{inspect(key)}: expected #{expected}"
+    end
+  end
+
+  defp safe_metadata_term?(term)
+       when is_atom(term) or is_binary(term) or is_number(term) or is_pid(term) or
+              is_reference(term),
+       do: true
+
+  defp safe_metadata_term?(list) when is_list(list), do: Enum.all?(list, &safe_metadata_term?/1)
+
+  defp safe_metadata_term?(tuple) when is_tuple(tuple) do
+    tuple |> Tuple.to_list() |> Enum.all?(&safe_metadata_term?/1)
+  end
+
+  defp safe_metadata_term?(map) when is_map(map) do
+    Enum.all?(map, fn {key, value} ->
+      safe_metadata_term?(key) and safe_metadata_term?(value)
+    end)
+  end
+
+  defp safe_metadata_term?(_term), do: false
 
   def to_storage_term(%Meta{} = meta) do
     meta

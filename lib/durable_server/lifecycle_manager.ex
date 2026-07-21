@@ -125,6 +125,7 @@ defmodule DurableServer.LifecycleManager do
             capacity_limits: %{},
             heartbeat_meta: nil,
             last_successful_heartbeat_at: nil,
+            last_successful_heartbeat_monotonic_at: nil,
             heartbeat_watchdog: nil,
             # Last successful heartbeat timing for diagnostics
             last_heartbeat_timing: nil,
@@ -160,6 +161,7 @@ defmodule DurableServer.LifecycleManager do
   @default_parallel_restart_batch_size 50
   # Default threshold for considering a node's heartbeat stale
   @default_heartbeat_staleness_threshold_ms :timer.seconds(30)
+  @default_heartbeat_future_skew_tolerance_ms :timer.seconds(5)
   # Threshold for considering a node unhealthy when finding eligible placement nodes
   @node_health_staleness_threshold_ms :timer.seconds(50)
   @resource_check_interval_ms :timer.seconds(60)
@@ -170,6 +172,7 @@ defmodule DurableServer.LifecycleManager do
   @discovery_skip_sweep_interval_ms :timer.minutes(5)
   @heartbeat_group_key "__heartbeat"
   @heartbeat_write_retry_backoff_ms {50, 250}
+  @heartbeat_req_max_retries 100
 
   def name(supervisor_name), do: :"#{supervisor_name}_lifecycle_manager"
 
@@ -285,8 +288,8 @@ defmodule DurableServer.LifecycleManager do
 
   defp high_cardinality_diag_key?(_), do: false
 
-  def stop_discovery(supervisor_name) do
-    GenServer.call(name(supervisor_name), :stop_discovery)
+  def stop_discovery(supervisor_name, timeout \\ 5_000) do
+    GenServer.call(name(supervisor_name), :stop_discovery, timeout)
   end
 
   @impl true
@@ -347,6 +350,7 @@ defmodule DurableServer.LifecycleManager do
         restart_claim_gate_disable_after_ms: @restart_claim_gate_disable_after_ms,
         heartbeat_interval_ms: 10_000,
         heartbeat_staleness_threshold_ms: @default_heartbeat_staleness_threshold_ms,
+        heartbeat_future_skew_tolerance_ms: @default_heartbeat_future_skew_tolerance_ms,
         heartbeat_tracking_mode: :poll,
         heartbeat_reconcile_interval_ms: 10_000,
         prefix: "test/"
@@ -360,6 +364,10 @@ defmodule DurableServer.LifecycleManager do
       |> Map.put_new(:restart_claim_gate_expand_after_ms, @restart_claim_gate_expand_after_ms)
       |> Map.put_new(:restart_claim_gate_disable_after_ms, @restart_claim_gate_disable_after_ms)
       |> Map.put_new(:heartbeat_staleness_threshold_ms, @default_heartbeat_staleness_threshold_ms)
+      |> Map.put_new(
+        :heartbeat_future_skew_tolerance_ms,
+        @default_heartbeat_future_skew_tolerance_ms
+      )
       |> Map.put_new(:heartbeat_tracking_mode, :poll)
       |> Map.put_new(:heartbeat_reconcile_interval_ms, 10_000)
 
@@ -456,7 +464,8 @@ defmodule DurableServer.LifecycleManager do
 
     # we MUST start with a populated node heartbeat cache
     # perform_heartbeat writes our heartbeat and refreshes the node health cache
-    {timing, heartbeat_entry} = perform_heartbeat(state, refresh_cache?: true)
+    {timing, heartbeat_entry, heartbeat_monotonic_at} =
+      perform_heartbeat(state, refresh_cache?: true)
 
     # Join Group with heartbeat data so other nodes see us instantly via peer_connect.
     # S3 is the source of truth for liveness; Group is the fast path for discovery.
@@ -466,7 +475,7 @@ defmodule DurableServer.LifecycleManager do
       HeartbeatWatchdog.arm(
         state.heartbeat_watchdog,
         self(),
-        heartbeat_entry_timestamp(heartbeat_entry),
+        heartbeat_monotonic_at,
         heartbeat_hard_deadline_ms(state)
       )
 
@@ -474,15 +483,16 @@ defmodule DurableServer.LifecycleManager do
      %{
        state
        | last_successful_heartbeat_at: heartbeat_entry_timestamp(heartbeat_entry),
+         last_successful_heartbeat_monotonic_at: heartbeat_monotonic_at,
          last_heartbeat_timing: timing
      }}
   end
 
   @impl true
   def handle_info(:heartbeat, %LifecycleManager{} = state) do
-    now = System.system_time(:millisecond)
+    now = System.monotonic_time(:millisecond)
     deadline_ms = heartbeat_hard_deadline_ms(state)
-    deadline_at = state.last_successful_heartbeat_at + deadline_ms
+    deadline_at = state.last_successful_heartbeat_monotonic_at + deadline_ms
 
     # Check if we've already exceeded the deadline
     if now >= deadline_at do
@@ -498,15 +508,11 @@ defmodule DurableServer.LifecycleManager do
       task =
         Task.Supervisor.async(state.task_sup, fn ->
           :ok = HeartbeatWatchdog.track_heartbeat_task(heartbeat_watchdog, owner, self())
-          {timing, heartbeat_entry} = perform_heartbeat(state)
+          {timing, heartbeat_entry, heartbeat_monotonic_at} = perform_heartbeat(state)
 
-          HeartbeatWatchdog.renew(
-            heartbeat_watchdog,
-            owner,
-            heartbeat_entry_timestamp(heartbeat_entry)
-          )
+          HeartbeatWatchdog.renew(heartbeat_watchdog, owner, heartbeat_monotonic_at)
 
-          {:heartbeat, {timing, heartbeat_entry}}
+          {:heartbeat, {timing, heartbeat_entry, heartbeat_monotonic_at}}
         end)
 
       {:noreply, %{state | current_heartbeat_task: task}}
@@ -589,7 +595,7 @@ defmodule DurableServer.LifecycleManager do
     end
 
     task =
-      Task.Supervisor.async(state.task_sup, fn ->
+      Task.Supervisor.async_nolink(state.task_sup, fn ->
         {:discover, discover_and_restart_servers(state)}
       end)
 
@@ -623,7 +629,7 @@ defmodule DurableServer.LifecycleManager do
   end
 
   def handle_info(
-        {ref, {:heartbeat, {timing, heartbeat_entry}}},
+        {ref, {:heartbeat, {timing, heartbeat_entry, heartbeat_monotonic_at}}},
         %LifecycleManager{current_heartbeat_task: %Task{ref: ref}} = state
       ) do
     # heartbeat task completed successfully and already renewed the watchdog directly.
@@ -646,6 +652,7 @@ defmodule DurableServer.LifecycleManager do
        state
        | current_heartbeat_task: nil,
          last_successful_heartbeat_at: heartbeat_entry_timestamp(heartbeat_entry),
+         last_successful_heartbeat_monotonic_at: heartbeat_monotonic_at,
          last_heartbeat_timing: timing
      }}
   end
@@ -703,15 +710,20 @@ defmodule DurableServer.LifecycleManager do
     # without waiting for the next periodic heartbeat tick.
     state =
       case write_node_heartbeat(state) do
-        {:ok, heartbeat_entry} ->
+        {:ok, {heartbeat_entry, heartbeat_monotonic_at}} ->
           HeartbeatWatchdog.renew(
             state.heartbeat_watchdog,
             self(),
-            heartbeat_entry_timestamp(heartbeat_entry)
+            heartbeat_monotonic_at
           )
 
           join_group_heartbeat(state, heartbeat_entry)
-          %{state | last_successful_heartbeat_at: heartbeat_entry_timestamp(heartbeat_entry)}
+
+          %{
+            state
+            | last_successful_heartbeat_at: heartbeat_entry_timestamp(heartbeat_entry),
+              last_successful_heartbeat_monotonic_at: heartbeat_monotonic_at
+          }
 
         {:error, reason} ->
           log(state, :warning, fn ->
@@ -760,15 +772,15 @@ defmodule DurableServer.LifecycleManager do
     # Do the critical heartbeat PUT inline
     put_start = System.monotonic_time(:millisecond)
 
-    heartbeat_entry =
+    {heartbeat_entry, heartbeat_monotonic_at} =
       case write_node_heartbeat(state) do
-        {:ok, entry} ->
+        {:ok, {entry, monotonic_at}} ->
           log(state, :debug, fn ->
             put_duration = System.monotonic_time(:millisecond) - put_start
             "Node heartbeat written successfully in #{put_duration}ms"
           end)
 
-          entry
+          {entry, monotonic_at}
 
         {:error, reason} ->
           put_duration = System.monotonic_time(:millisecond) - put_start
@@ -792,7 +804,11 @@ defmodule DurableServer.LifecycleManager do
 
     total_duration = System.monotonic_time(:millisecond) - start_time
 
-    {%{put_ms: put_duration, cache_ms: cache_duration, total_ms: total_duration}, heartbeat_entry}
+    {
+      %{put_ms: put_duration, cache_ms: cache_duration, total_ms: total_duration},
+      heartbeat_entry,
+      heartbeat_monotonic_at
+    }
   end
 
   defp refresh_heartbeat_cache_with_timing!(%LifecycleManager{} = state) do
@@ -947,6 +963,7 @@ defmodule DurableServer.LifecycleManager do
     node_str = to_string(Node.self())
     node_ref = DurableServer.Supervisor.node_ref(state.supervisor_name)
     current_time = System.system_time(:millisecond)
+    current_monotonic_time = System.monotonic_time(:millisecond)
 
     # calculate capacity and resource info
     capacity = DurableServer.Supervisor.current_capacity(state.supervisor_name)
@@ -983,14 +1000,15 @@ defmodule DurableServer.LifecycleManager do
     key = "#{state.prefix}__nodes/#{node_str}"
     entry = {node_str, node_ref, current_time, capacity, resources, env_vars, heartbeat_meta}
 
-    deadline_at = heartbeat_deadline_at(state, state.last_successful_heartbeat_at)
+    deadline_at =
+      heartbeat_deadline_at(state, state.last_successful_heartbeat_monotonic_at)
 
     case put_heartbeat_until_deadline(state, key, heartbeat_data, deadline_at) do
       {:ok, _} ->
         # update local ets cache with full capacity info
         :ets.insert(state.heartbeat_table, entry)
 
-        {:ok, entry}
+        {:ok, {entry, current_monotonic_time}}
 
       {:error, reason} ->
         {:error, reason}
@@ -1008,15 +1026,15 @@ defmodule DurableServer.LifecycleManager do
          deadline_at,
          attempt
        ) do
-    remaining_ms = max(deadline_at - System.system_time(:millisecond), 0)
+    remaining_ms = max(deadline_at - System.monotonic_time(:millisecond), 0)
 
     if remaining_ms <= 0 do
       {:error, :heartbeat_deadline_exceeded}
     else
-      # Give the backend one long write attempt using the remaining heartbeat budget.
-      # The outer LM retry loop handles fast-fail transient errors without compounding
-      # backend retries inside the same deadline window.
-      put_opts = [max_retries: 0, timeout: remaining_ms]
+      # Let Req retry transient HTTP and transport failures itself. The timeout keeps
+      # those retries inside the heartbeat budget; the outer loop remains for retryable
+      # errors from non-HTTP backends.
+      put_opts = [max_retries: @heartbeat_req_max_retries, timeout: remaining_ms]
 
       case StorageBackend.put_object(state.heartbeat_store, key, heartbeat_data, put_opts) do
         {:ok, _} = ok ->
@@ -1039,11 +1057,11 @@ defmodule DurableServer.LifecycleManager do
   end
 
   defp heartbeat_deadline_at(%LifecycleManager{} = state, nil),
-    do: System.system_time(:millisecond) + heartbeat_hard_deadline_ms(state)
+    do: System.monotonic_time(:millisecond) + heartbeat_hard_deadline_ms(state)
 
-  defp heartbeat_deadline_at(%LifecycleManager{} = state, last_successful_heartbeat_at)
-       when is_integer(last_successful_heartbeat_at) do
-    last_successful_heartbeat_at + heartbeat_hard_deadline_ms(state)
+  defp heartbeat_deadline_at(%LifecycleManager{} = state, last_successful_heartbeat_monotonic_at)
+       when is_integer(last_successful_heartbeat_monotonic_at) do
+    last_successful_heartbeat_monotonic_at + heartbeat_hard_deadline_ms(state)
   end
 
   defp heartbeat_entry_timestamp(
@@ -1167,8 +1185,14 @@ defmodule DurableServer.LifecycleManager do
         _ -> false
       end)
 
-    {dead_nodes, errors} =
+    {future_skewed_nodes, non_future_skewed_rest} =
       Enum.split_with(non_missing_rest, fn
+        {:future_skewed, _key} -> true
+        _ -> false
+      end)
+
+    {dead_nodes, errors} =
+      Enum.split_with(non_future_skewed_rest, fn
         {:dead, _key, _node, _node_ref, _timestamp} -> true
         _ -> false
       end)
@@ -1189,6 +1213,12 @@ defmodule DurableServer.LifecycleManager do
     if missing_nodes != [] do
       log(state, :debug, fn ->
         "Skipped #{length(missing_nodes)} raced heartbeat key(s) during cache refresh"
+      end)
+    end
+
+    if future_skewed_nodes != [] do
+      log(state, :warning, fn ->
+        "Ignored #{length(future_skewed_nodes)} heartbeat(s) beyond the future clock-skew tolerance"
       end)
     end
 
@@ -1230,17 +1260,35 @@ defmodule DurableServer.LifecycleManager do
 
   defp process_heartbeat_list_entry(
          %{key: key, body: body},
-         _state,
+         %LifecycleManager{} = state,
          current_time,
          dead_node_threshold_ms
        )
        when is_binary(key) and is_integer(current_time) and is_integer(dead_node_threshold_ms) do
     case parse_heartbeat_data(body) do
       {:ok, {node, node_ref, timestamp, capacity, resources, env_vars, heartbeat_meta}} ->
-        if current_time - timestamp > dead_node_threshold_ms do
-          {:dead, key, node, node_ref, timestamp}
-        else
-          {:alive, node, node_ref, timestamp, capacity, resources, env_vars, heartbeat_meta}
+        future_skew_tolerance_ms = state.config.heartbeat_future_skew_tolerance_ms
+
+        cond do
+          not heartbeat_timestamp_acceptable?(
+            timestamp,
+            current_time,
+            future_skew_tolerance_ms
+          ) ->
+            # Do not delete a future-skewed record: its writer may still be alive,
+            # but never admit it into the local liveness cache.
+            {:future_skewed, key}
+
+          heartbeat_fresh?(
+            timestamp,
+            current_time,
+            dead_node_threshold_ms,
+            future_skew_tolerance_ms
+          ) ->
+            {:alive, node, node_ref, timestamp, capacity, resources, env_vars, heartbeat_meta}
+
+          true ->
+            {:dead, key, node, node_ref, timestamp}
         end
 
       {:error, :invalid_format} ->
@@ -1380,17 +1428,20 @@ defmodule DurableServer.LifecycleManager do
     table_name = heartbeat_table_name(supervisor_name)
 
     %{
-      heartbeat_staleness_threshold_ms: heartbeat_staleness_threshold_ms
-    } =
-      DurableServer.Supervisor.__get_config__(supervisor_name)
+      heartbeat_staleness_threshold_ms: heartbeat_staleness_threshold_ms,
+      heartbeat_future_skew_tolerance_ms: future_skew_tolerance_ms
+    } = DurableServer.Supervisor.__get_config__(supervisor_name)
 
     case :ets.lookup(table_name, node_str) do
       [{^node_str, node_ref, timestamp, capacity, resources, env_vars, heartbeat_meta}] ->
         current_time = System.system_time(:millisecond)
 
-        if current_time - timestamp > heartbeat_staleness_threshold_ms do
-          :stale
-        else
+        if heartbeat_fresh?(
+             timestamp,
+             current_time,
+             heartbeat_staleness_threshold_ms,
+             future_skew_tolerance_ms
+           ) do
           {:healthy,
            %{
              node_ref: node_ref,
@@ -1399,6 +1450,8 @@ defmodule DurableServer.LifecycleManager do
              env_vars: env_vars,
              heartbeat_meta: heartbeat_meta
            }}
+        else
+          :stale
         end
 
       # Node not found in heartbeat table
@@ -1433,6 +1486,7 @@ defmodule DurableServer.LifecycleManager do
     config = DurableServer.Supervisor.__get_config__(supervisor_name)
     prefix = config.prefix
     heartbeat_staleness_threshold_ms = config.heartbeat_staleness_threshold_ms
+    future_skew_tolerance_ms = config.heartbeat_future_skew_tolerance_ms
     storage_backend = config.storage_backend
     heartbeat_store = Map.get(config, :heartbeat_backend, storage_backend)
 
@@ -1445,12 +1499,17 @@ defmodule DurableServer.LifecycleManager do
            {_node_str, node_ref, timestamp, _capacity, _resources, _env_vars, _heartbeat_meta}} ->
             current_time = System.system_time(:millisecond)
 
-            if current_time - timestamp > heartbeat_staleness_threshold_ms do
-              :stale
-            else
+            if heartbeat_fresh?(
+                 timestamp,
+                 current_time,
+                 heartbeat_staleness_threshold_ms,
+                 future_skew_tolerance_ms
+               ) do
               # Cache the fetched heartbeat so subsequent lookups are fast
               cache_fetched_heartbeat(supervisor_name, body)
               {:healthy, %{node_ref: node_ref}}
+            else
+              :stale
             end
 
           {:error, :invalid_format} ->
@@ -1589,6 +1648,15 @@ defmodule DurableServer.LifecycleManager do
               "heartbeat_staleness_threshold_ms must be an integer greater than #{@heartbeat_deadline_buffer_ms}, got: #{inspect(other)}"
     end
 
+    case Map.fetch!(config, :heartbeat_future_skew_tolerance_ms) do
+      value when is_integer(value) and value >= 0 ->
+        :ok
+
+      other ->
+        raise ArgumentError,
+              "heartbeat_future_skew_tolerance_ms must be a non-negative integer, got: #{inspect(other)}"
+    end
+
     max_heartbeat_interval = div(Map.fetch!(config, :heartbeat_staleness_threshold_ms), 2)
 
     case Map.fetch!(config, :heartbeat_interval_ms) do
@@ -1621,6 +1689,33 @@ defmodule DurableServer.LifecycleManager do
 
   defp heartbeat_staleness_threshold_ms(%LifecycleManager{} = state) do
     Map.fetch!(state.config, :heartbeat_staleness_threshold_ms)
+  end
+
+  defp heartbeat_fresh?(timestamp, now, staleness_threshold_ms, future_skew_tolerance_ms)
+       when is_integer(timestamp) and is_integer(now) do
+    age_ms = now - timestamp
+    age_ms >= -future_skew_tolerance_ms and age_ms <= staleness_threshold_ms
+  end
+
+  defp heartbeat_fresh?(_timestamp, _now, _staleness_threshold_ms, _future_skew_tolerance_ms),
+    do: false
+
+  defp heartbeat_timestamp_acceptable?(timestamp, now, future_skew_tolerance_ms)
+       when is_integer(timestamp),
+       do: timestamp <= now + future_skew_tolerance_ms
+
+  defp heartbeat_timestamp_acceptable?(_timestamp, _now, _future_skew_tolerance_ms), do: false
+
+  defp configured_future_skew_tolerance_ms(supervisor_name) do
+    supervisor_name
+    |> DurableServer.Supervisor.__get_config__()
+    |> Map.get(
+      :heartbeat_future_skew_tolerance_ms,
+      @default_heartbeat_future_skew_tolerance_ms
+    )
+  rescue
+    RuntimeError -> @default_heartbeat_future_skew_tolerance_ms
+    ArgumentError -> @default_heartbeat_future_skew_tolerance_ms
   end
 
   defp preferred_restart_claimer?(
@@ -1729,6 +1824,7 @@ defmodule DurableServer.LifecycleManager do
           )
 
         delays = get_sticky_placement_delays(supervisor_name, meta.module)
+        future_skew_tolerance_ms = configured_future_skew_tolerance_ms(supervisor_name)
 
         node_health = lookup_node_health(meta)
 
@@ -1748,7 +1844,12 @@ defmodule DurableServer.LifecycleManager do
           try do
             node = String.to_existing_atom(node_str)
 
-            if now - timestamp <= @node_health_staleness_threshold_ms do
+            if heartbeat_fresh?(
+                 timestamp,
+                 now,
+                 @node_health_staleness_threshold_ms,
+                 future_skew_tolerance_ms
+               ) do
               candidate_health =
                 {:healthy,
                  %{
@@ -2723,13 +2824,51 @@ defmodule DurableServer.LifecycleManager do
       the local disk, so rejecting based on disk usage would be counterproductive.
   """
   def check_capacity(supervisor_name, module, opts \\ []) do
-    opts = Keyword.validate!(opts, [:bypass_disk_check])
+    opts = Keyword.validate!(opts, [:bypass_disk_check, :skip_count_limits])
+
+    count_result =
+      if Keyword.get(opts, :skip_count_limits, false) do
+        :ok
+      else
+        check_count_limits(supervisor_name, module)
+      end
 
     with :ok <- check_shutting_down(supervisor_name),
-         :ok <- check_count_limits(supervisor_name, module),
-         :ok <- check_resource_limits(supervisor_name, opts) do
+         :ok <- count_result,
+         :ok <- check_resource_limits(supervisor_name, Keyword.take(opts, [:bypass_disk_check])) do
       :ok
     end
+  end
+
+  @doc false
+  def reserve_capacity(supervisor_name, module, opts \\ []) do
+    opts = Keyword.validate!(opts, [:bypass_disk_check])
+
+    %{ets_table: table_name} =
+      DurableServer.Supervisor.__get_config__(supervisor_name)
+
+    with :ok <- check_shutting_down(supervisor_name),
+         :ok <- check_resource_limits(supervisor_name, opts),
+         {:ok, counter_keys} <- reserve_count_slots(table_name, module) do
+      {:ok, start_capacity_reservation_keeper(table_name, counter_keys, self())}
+    end
+  end
+
+  @doc false
+  def commit_capacity_reservation(nil, _pid), do: :ok
+
+  def commit_capacity_reservation(reservation, pid)
+      when is_pid(reservation) and is_pid(pid) do
+    send(reservation, {:commit, pid})
+    :ok
+  end
+
+  @doc false
+  def cancel_capacity_reservation(nil), do: :ok
+
+  def cancel_capacity_reservation(reservation) when is_pid(reservation) do
+    send(reservation, :cancel)
+    :ok
   end
 
   defp check_shutting_down(supervisor_name) do
@@ -2753,13 +2892,8 @@ defmodule DurableServer.LifecycleManager do
         :ok
 
       max_children_limits ->
-        global_count = Group.local_registry_count(supervisor_name)
-
-        module_count =
-          Group.local_member_count(
-            supervisor_name,
-            DurableServer.Supervisor.__module_group_prefix__(module)
-          )
+        global_count = capacity_counter(table_name, :capacity_count_total)
+        module_count = capacity_counter(table_name, capacity_module_counter_key(module))
 
         total_limit = max_children_limits[:total]
         module_limit = max_children_limits[module]
@@ -2779,6 +2913,96 @@ defmodule DurableServer.LifecycleManager do
         end
     end
   end
+
+  defp reserve_count_slots(table_name, module) do
+    [{:capacity_limits, limits}] = :ets.lookup(table_name, :capacity_limits)
+    max_children_limits = Map.get(limits, :max_children, %{})
+    total_limit = max_children_limits[:total]
+    module_limit = max_children_limits[module]
+
+    case reserve_capacity_counter(
+           table_name,
+           :capacity_count_total,
+           total_limit,
+           :max_children_total,
+           %{limit: total_limit}
+         ) do
+      {:ok, total_keys} ->
+        case reserve_capacity_counter(
+               table_name,
+               capacity_module_counter_key(module),
+               module_limit,
+               :max_children_module,
+               %{module: module, limit: module_limit}
+             ) do
+          {:ok, module_keys} ->
+            {:ok, total_keys ++ module_keys}
+
+          {:error, reason} ->
+            release_capacity_counters(table_name, total_keys)
+            {:error, reason}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp reserve_capacity_counter(_table_name, _key, nil, _reason, _details), do: {:ok, []}
+
+  defp reserve_capacity_counter(table_name, key, limit, reason, details) do
+    current = :ets.update_counter(table_name, key, {2, 1}, {key, 0})
+
+    if current <= limit do
+      {:ok, [key]}
+    else
+      :ets.update_counter(table_name, key, {2, -1})
+
+      {:error, {:limit_reached, reason, Map.put(details, :current, current - 1)}}
+    end
+  end
+
+  defp start_capacity_reservation_keeper(_table_name, [], _owner), do: nil
+
+  defp start_capacity_reservation_keeper(table_name, counter_keys, owner) do
+    spawn(fn ->
+      owner_ref = Process.monitor(owner)
+
+      receive do
+        {:commit, child_pid} when is_pid(child_pid) ->
+          Process.demonitor(owner_ref, [:flush])
+          child_ref = Process.monitor(child_pid)
+
+          receive do
+            {:DOWN, ^child_ref, :process, ^child_pid, _reason} ->
+              release_capacity_counters(table_name, counter_keys)
+          end
+
+        :cancel ->
+          Process.demonitor(owner_ref, [:flush])
+          release_capacity_counters(table_name, counter_keys)
+
+        {:DOWN, ^owner_ref, :process, ^owner, _reason} ->
+          release_capacity_counters(table_name, counter_keys)
+      end
+    end)
+  end
+
+  defp release_capacity_counters(table_name, counter_keys) do
+    Enum.each(counter_keys, &:ets.update_counter(table_name, &1, {2, -1}))
+    :ok
+  rescue
+    ArgumentError -> :ok
+  end
+
+  defp capacity_counter(table_name, key) do
+    case :ets.lookup(table_name, key) do
+      [{^key, count}] -> count
+      [] -> 0
+    end
+  end
+
+  defp capacity_module_counter_key(module), do: {:capacity_count_module, module}
 
   defp check_resource_limits(supervisor_name, opts) do
     opts = Keyword.validate!(opts, [:bypass_disk_check])
@@ -3095,6 +3319,7 @@ defmodule DurableServer.LifecycleManager do
           end
 
         now = System.system_time(:millisecond)
+        future_skew_tolerance_ms = configured_future_skew_tolerance_ms(supervisor_name)
 
         # Merge two data sources per node, picking whichever has the more recent timestamp:
         # 1. S3 heartbeat ETS cache — source of truth for "can this node reach S3?"
@@ -3108,10 +3333,13 @@ defmodule DurableServer.LifecycleManager do
           try do
             node = String.to_existing_atom(node_str)
 
-            heartbeat_age_ms = now - timestamp
-
             health =
-              if heartbeat_age_ms <= @node_health_staleness_threshold_ms do
+              if heartbeat_fresh?(
+                   timestamp,
+                   now,
+                   @node_health_staleness_threshold_ms,
+                   future_skew_tolerance_ms
+                 ) do
                 {:healthy,
                  %{
                    node_ref: node_ref,
@@ -3152,9 +3380,17 @@ defmodule DurableServer.LifecycleManager do
   # Merge heartbeat data from S3 ETS cache and Group PG members.
   # For each node present in both sources, pick the entry with the more recent timestamp.
   # Returns a list of heartbeat tuples in the same shape as the ETS entries.
-  defp merge_heartbeat_sources(supervisor_name, heartbeat_table, _now) do
-    # Start with ETS cache as the base (keyed by node_str)
-    ets_entries = :ets.tab2list(heartbeat_table)
+  defp merge_heartbeat_sources(supervisor_name, heartbeat_table, now) do
+    future_skew_tolerance_ms = configured_future_skew_tolerance_ms(supervisor_name)
+
+    # Start with ETS cache as the base (keyed by node_str). Ignore timestamps
+    # too far in the future before choosing the newest source for a node.
+    ets_entries =
+      heartbeat_table
+      |> :ets.tab2list()
+      |> Enum.filter(fn {_node, _ref, timestamp, _capacity, _resources, _env, _meta} ->
+        heartbeat_timestamp_acceptable?(timestamp, now, future_skew_tolerance_ms)
+      end)
 
     ets_map =
       Map.new(ets_entries, fn {node_str, _node_ref, _ts, _cap, _res, _env, _meta} = entry ->
@@ -3179,18 +3415,22 @@ defmodule DurableServer.LifecycleManager do
           {node_str, meta.node_ref, group_ts, meta.capacity, meta.resources, meta.env_vars,
            meta.heartbeat_meta}
 
-        case Map.get(acc, node_str) do
-          nil ->
-            # Node only in Group (new node, not yet in S3 cache) — use Group data
-            Map.put(acc, node_str, group_entry)
+        if heartbeat_timestamp_acceptable?(group_ts, now, future_skew_tolerance_ms) do
+          case Map.get(acc, node_str) do
+            nil ->
+              # Node only in Group (new node, not yet in S3 cache) — use Group data
+              Map.put(acc, node_str, group_entry)
 
-          {_ns, _nr, ets_ts, _c, _r, _e, _m} when group_ts > ets_ts ->
-            # Group data is more recent — use it
-            Map.put(acc, node_str, group_entry)
+            {_ns, _nr, ets_ts, _c, _r, _e, _m} when group_ts > ets_ts ->
+              # Group data is more recent — use it
+              Map.put(acc, node_str, group_entry)
 
-          _ets_entry ->
-            # ETS data is same age or more recent — keep it
-            acc
+            _ets_entry ->
+              # ETS data is same age or more recent — keep it
+              acc
+          end
+        else
+          acc
         end
       end)
 

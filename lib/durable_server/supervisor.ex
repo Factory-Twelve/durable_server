@@ -57,7 +57,7 @@ defmodule DurableServer.Supervisor do
   ### Node Heartbeats
 
   The LifecycleManager maintains node-level heartbeats in object storage at
-  `{prefix}nodes/{node_name}` and caches them locally for efficient health
+  `{prefix}__nodes/{node_name}` and caches them locally for efficient health
   checking during restart decisions.
 
   ## Configuration Options
@@ -88,10 +88,16 @@ defmodule DurableServer.Supervisor do
   - `:heartbeat_interval_ms` - How often to write node heartbeats (default: 10_000)
   - `:heartbeat_staleness_threshold_ms` - How long a node heartbeat may go without success
     before the node is considered stale/orphan-claimable (default: 30_000)
+  - `:heartbeat_future_skew_tolerance_ms` - Maximum accepted clock lead in a persisted
+    cross-node heartbeat (default: 5_000)
   - `:heartbeat_tracking_mode` - Heartbeat cache strategy: `:poll` or `:subscribe`.
     Defaults from backend capabilities.
   - `:heartbeat_reconcile_interval_ms` - Full heartbeat cache reconcile interval used
     in `:subscribe` mode (default from backend capabilities).
+  - `:graceful_shutdown_timeout_ms` - Maximum time each child gets to persist and stop
+    once its shutdown begins (default: 30_000).
+  - `:graceful_shutdown_total_timeout_ms` - Maximum time for the complete coordinated
+    shutdown, including discovery and all child batches (default: 55_000).
   - `:dead_node_threshold_ms` - How long before a node is considered permanently dead and cleaned up
     (default: 86_400_000 = 24 hours)
   - `:crash_threshold_count` - Number of crashes before marking object as permanently crashed
@@ -229,6 +235,7 @@ defmodule DurableServer.Supervisor do
   @default_parallel_restart_batch_size 50
   @default_restart_start_timeout_ms 30_000
   @default_heartbeat_staleness_threshold_ms 30_000
+  @default_heartbeat_future_skew_tolerance_ms 5_000
   @default_restart_claim_preferred_fanout 2
   @default_restart_claim_expanded_fanout 4
   @default_restart_claim_gate_expand_after_ms :timer.seconds(30)
@@ -597,7 +604,7 @@ defmodule DurableServer.Supervisor do
         # add total capacity if configured
         capacity_map =
           if total_limit = max_children[:total] do
-            current = Group.local_registry_count(supervisor_name)
+            current = capacity_count(table_name, :capacity_count_total)
             Map.put(capacity_map, :total, %{current: current, limit: total_limit})
           else
             capacity_map
@@ -609,10 +616,7 @@ defmodule DurableServer.Supervisor do
           |> Enum.reject(fn {k, _v} -> k == :total end)
           |> Enum.reduce(capacity_map, fn {module, limit}, acc ->
             current =
-              Group.local_member_count(
-                supervisor_name,
-                __module_group_prefix__(module)
-              )
+              capacity_count(table_name, {:capacity_count_module, module})
 
             Map.put(acc, module, %{current: current, limit: limit})
           end)
@@ -621,6 +625,13 @@ defmodule DurableServer.Supervisor do
     end
   rescue
     _ -> nil
+  end
+
+  defp capacity_count(table_name, key) do
+    case :ets.lookup(table_name, key) do
+      [{^key, count}] -> count
+      [] -> 0
+    end
   end
 
   @doc """
@@ -646,6 +657,8 @@ defmodule DurableServer.Supervisor do
     (default: 30_000)
   - `:heartbeat_tracking_mode` - Heartbeat cache strategy: `:poll` or `:subscribe`
   - `:heartbeat_reconcile_interval_ms` - Full heartbeat cache reconcile interval
+  - `:graceful_shutdown_timeout_ms` - Per-child graceful shutdown timeout (default: 30_000)
+  - `:graceful_shutdown_total_timeout_ms` - Overall graceful shutdown timeout (default: 55_000)
   - `:dead_node_threshold_ms` - Dead node cleanup threshold (default: 300_000)
   - `:crash_threshold_count` - Crashes before permanent crash (default: 5)
   - `:crash_threshold_window_ms` - Crash threshold window (default: 3_600_000)
@@ -673,23 +686,45 @@ defmodule DurableServer.Supervisor do
       raise ArgumentError, "prefix must end with '/', got: #{inspect(prefix)}"
     end
 
-    # claim the prefix to prevent conflicts between supervisors
+    ensure_prefix_unclaimed!(prefix)
+    Supervisor.start_link(__MODULE__, opts, name: name)
+  end
+
+  defp ensure_prefix_unclaimed!(prefix) do
     prefix_key = {__MODULE__, :prefix, prefix}
 
     case :persistent_term.get(prefix_key, nil) do
       nil ->
-        :persistent_term.put(prefix_key, name)
+        :ok
 
-      existing_name when existing_name != name ->
-        raise ArgumentError,
-              "prefix #{inspect(prefix)} is already claimed by supervisor #{inspect(existing_name)}"
+      existing_name ->
+        if Process.whereis(existing_name) != nil do
+          raise ArgumentError,
+                "prefix #{inspect(prefix)} is already claimed by supervisor #{inspect(existing_name)}"
+        end
+    end
+  end
+
+  defp claim_prefix!(prefix, name) do
+    prefix_key = {__MODULE__, :prefix, prefix}
+
+    case :persistent_term.get(prefix_key, nil) do
+      nil ->
+        :ok
 
       ^name ->
-        raise ArgumentError,
-              "the prefix #{inspect(prefix)} has already been claimed by another process"
+        :persistent_term.erase(prefix_key)
+
+      existing_name ->
+        if Process.whereis(existing_name) == nil do
+          :persistent_term.erase(prefix_key)
+        else
+          raise ArgumentError,
+                "prefix #{inspect(prefix)} is already claimed by supervisor #{inspect(existing_name)}"
+        end
     end
 
-    Supervisor.start_link(__MODULE__, opts, name: name)
+    :persistent_term.put(prefix_key, name)
   end
 
   @doc false
@@ -802,6 +837,8 @@ defmodule DurableServer.Supervisor do
           raise ArgumentError, "#{function_name} requires :key"
       end
 
+    validate_durable_key!(key, function_name)
+
     initial_state =
       case Keyword.fetch(args, :initial_state) do
         {:ok, initial_state} when is_map(initial_state) ->
@@ -823,6 +860,15 @@ defmodule DurableServer.Supervisor do
   defp validate_child_init_arg!(init_arg, function_name) do
     raise ArgumentError,
           "#{function_name} expects {Module, key: \"...\", initial_state: %{...}}, got: #{inspect(init_arg)}"
+  end
+
+  defp validate_durable_key!(key, function_name) do
+    if key == "__nodes" or String.starts_with?(key, "__nodes/") do
+      raise ArgumentError,
+            "#{function_name} :key uses the reserved internal namespace __nodes/: #{inspect(key)}"
+    end
+
+    :ok
   end
 
   defp do_start_child_with_init_arg(supervisor, {module, init_arg, boot_info}, opts) do
@@ -1083,27 +1129,36 @@ defmodule DurableServer.Supervisor do
          reply_to
        ) do
     # Reject before spawning a local child when this node is draining.
-    case check_local_start_capacity(supervisor, module, boot_info) do
-      :ok ->
-        do_start_child_inner(
-          supervisor,
-          module,
-          init_arg,
-          boot_info,
-          key,
-          retries,
-          deadline_ms,
-          reply_to
-        )
+    case reserve_local_start_capacity(supervisor, module, boot_info) do
+      {:ok, capacity_reservation} ->
+        try do
+          do_start_child_inner(
+            supervisor,
+            module,
+            init_arg,
+            boot_info,
+            key,
+            retries,
+            deadline_ms,
+            reply_to,
+            capacity_reservation
+          )
+        after
+          LifecycleManager.cancel_capacity_reservation(capacity_reservation)
+        end
 
       {:error, {:capacity_limit, _reason}} = error ->
         error
     end
   end
 
-  defp check_local_start_capacity(supervisor, module, boot_info) do
-    case LifecycleManager.check_capacity(supervisor, module, local_start_capacity_opts(boot_info)) do
-      :ok -> :ok
+  defp reserve_local_start_capacity(supervisor, module, boot_info) do
+    case LifecycleManager.reserve_capacity(
+           supervisor,
+           module,
+           local_start_capacity_opts(boot_info)
+         ) do
+      {:ok, reservation} -> {:ok, reservation}
       {:error, {:limit_reached, reason, _details}} -> {:error, {:capacity_limit, reason}}
     end
   end
@@ -1124,7 +1179,8 @@ defmodule DurableServer.Supervisor do
          key,
          retries,
          deadline_ms,
-         reply_to
+         reply_to,
+         capacity_reservation
        ) do
     dynamic_sup = get_dynamic_supervisor(supervisor)
     config = __get_config__(supervisor)
@@ -1147,6 +1203,7 @@ defmodule DurableServer.Supervisor do
 
     case DynamicSupervisor.start_child(dynamic_sup, child_spec) do
       {:ok, pid} ->
+        LifecycleManager.commit_capacity_reservation(capacity_reservation, pid)
         monitor_ref = Process.monitor(pid)
         timeout_ms = remaining_timeout_ms(deadline_ms)
 
@@ -1320,6 +1377,9 @@ defmodule DurableServer.Supervisor do
               {:error, :timeout}
           end
         end
+
+      {:error, :max_children} ->
+        {:error, {:capacity_limit, :max_children_total}}
 
       {:error, reason} ->
         {:error, reason}
@@ -1516,7 +1576,12 @@ defmodule DurableServer.Supervisor do
 
   defp restart_claim_race_final_retry?(_retries, _remaining_ms), do: false
 
-  defp try_remote_placement(supervisor, {module, init_arg, boot_info} = child_spec, max_retries) do
+  defp try_remote_placement(
+         supervisor,
+         {module, init_arg, boot_info} = child_spec,
+         max_retries,
+         deadline
+       ) do
     key = Keyword.fetch!(init_arg, :key)
 
     sticky_placement =
@@ -1551,7 +1616,8 @@ defmodule DurableServer.Supervisor do
       nodes ->
         try_nodes(supervisor, child_spec, nodes,
           key: key,
-          sticky_placement: sticky_placement
+          sticky_placement: sticky_placement,
+          deadline: deadline
         )
     end
   end
@@ -1632,7 +1698,7 @@ defmodule DurableServer.Supervisor do
   end
 
   defp try_remote_placement_with_retry(supervisor, child_spec, max_retries, deadline) do
-    case try_remote_placement(supervisor, child_spec, max_retries) do
+    case try_remote_placement(supervisor, child_spec, max_retries, deadline) do
       {:ok, result} ->
         {:ok, result}
 
@@ -1744,11 +1810,17 @@ defmodule DurableServer.Supervisor do
     Logger.info("Attempting to place #{inspect(module)} on remote node #{inspect(node)}")
     report_placement_diagnostic(supervisor, :remote_placement_erpc_attempt)
     shutdown_retries = Keyword.get(placement_opts, :shutdown_retries, 0)
-    erpc_timeout_ms = placement_erpc_timeout_ms(supervisor, node)
+    deadline = Keyword.get(placement_opts, :deadline)
+    erpc_timeout_ms = __placement_erpc_timeout_ms__(supervisor, node, deadline)
     {remote_child_spec, remote_opts} = remote_start_child_args(child_spec)
+    remote_opts = Keyword.put(remote_opts, :timeout, erpc_timeout_ms)
 
     # NOTE: we MUST pass max_placement_retries: 0 to prevent recursive retry on the other side
     try do
+      if erpc_timeout_ms == 0 do
+        throw({:error, :placement_deadline_expired})
+      end
+
       result =
         safe_erpc_call(
           node,
@@ -1784,6 +1856,9 @@ defmodule DurableServer.Supervisor do
           try_nodes(supervisor, child_spec, rest, placement_opts)
       end
     catch
+      :throw, {:error, :placement_deadline_expired} ->
+        {:error, :timeout}
+
       :throw, {:error, :not_ready} ->
         report_placement_diagnostic(supervisor, :remote_placement_not_ready)
         Logger.warning("Node #{inspect(node)} not ready (still starting up), trying next node")
@@ -1847,6 +1922,17 @@ defmodule DurableServer.Supervisor do
         )
 
         try_nodes(supervisor, child_spec, rest, placement_opts)
+    end
+  end
+
+  @doc false
+  def __placement_erpc_timeout_ms__(supervisor, node, deadline)
+      when is_atom(supervisor) and is_atom(node) do
+    configured_timeout = placement_erpc_timeout_ms(supervisor, node)
+
+    case remaining_timeout_ms(deadline) do
+      :infinity -> configured_timeout
+      remaining_ms -> min(configured_timeout, remaining_ms)
     end
   end
 
@@ -2270,7 +2356,7 @@ defmodule DurableServer.Supervisor do
     owner_registry = ensure_started_singleflight_registry_name(supervisor)
     waiters_registry = ensure_started_singleflight_waiters_registry_name(supervisor)
 
-    case Registry.register(owner_registry, singleflight_key, :singleflight_owner) do
+    case safe_registry_register(owner_registry, singleflight_key, :singleflight_owner) do
       {:ok, _owner_pid} ->
         report_singleflight_diagnostic(supervisor, diagnostics, :leader)
 
@@ -2300,11 +2386,17 @@ defmodule DurableServer.Supervisor do
           wait_timeout_ms,
           diagnostics
         )
+
+      {:error, :registry_unavailable} ->
+        # Supervisor is shutting down or the registry is already gone.
+        {:result, fun.()}
     end
+  end
+
+  defp safe_registry_register(registry, key, value) do
+    Registry.register(registry, key, value)
   rescue
-    ArgumentError ->
-      # Supervisor is shutting down or registry already gone; fall back to direct call.
-      {:result, fun.()}
+    ArgumentError -> {:error, :registry_unavailable}
   end
 
   defp wait_for_supervisor_singleflight_owner(
@@ -2335,12 +2427,14 @@ defmodule DurableServer.Supervisor do
 
           result =
             try do
-              case Registry.register(
+              case __register_singleflight_waiter__(
+                     owner_registry,
                      waiters_registry,
                      singleflight_key,
+                     owner_pid,
                      {waiter_ref, reply_alias}
                    ) do
-                {:ok, _} ->
+                :wait ->
                   receive do
                     {:singleflight_done, ^singleflight_key, ^waiter_ref, singleflight_result} ->
                       {:result, singleflight_result}
@@ -2366,8 +2460,11 @@ defmodule DurableServer.Supervisor do
                       end
                   end
 
-                {:error, {:already_registered, _}} ->
+                :retry ->
                   :retry
+
+                {:follow_owner, new_owner_pid} ->
+                  {:follow_owner, new_owner_pid}
               end
             after
               :erlang.unalias(reply_alias)
@@ -2393,6 +2490,30 @@ defmodule DurableServer.Supervisor do
               other
           end
       end
+    end
+  rescue
+    ArgumentError -> :retry
+  end
+
+  @doc false
+  def __register_singleflight_waiter__(
+        owner_registry,
+        waiters_registry,
+        singleflight_key,
+        owner_pid,
+        waiter_value
+      )
+      when is_atom(owner_registry) and is_atom(waiters_registry) and is_pid(owner_pid) do
+    case Registry.register(waiters_registry, singleflight_key, waiter_value) do
+      {:ok, _} ->
+        case Registry.lookup(owner_registry, singleflight_key) do
+          [{^owner_pid, _value}] -> :wait
+          [{new_owner_pid, _value}] when is_pid(new_owner_pid) -> {:follow_owner, new_owner_pid}
+          [] -> :retry
+        end
+
+      {:error, {:already_registered, _pid}} ->
+        :retry
     end
   rescue
     ArgumentError -> :retry
@@ -2454,7 +2575,7 @@ defmodule DurableServer.Supervisor do
          deadline
        ) do
     # First attempt remote placement (single round, no retry loop — we handle retry here)
-    case try_remote_placement(supervisor, child_spec, 3) do
+    case try_remote_placement(supervisor, child_spec, 3, deadline) do
       {:ok, result} ->
         {:ok, result}
 
@@ -3110,9 +3231,11 @@ defmodule DurableServer.Supervisor do
         :restart_claim_gate_disable_after_ms,
         :heartbeat_interval_ms,
         :heartbeat_staleness_threshold_ms,
+        :heartbeat_future_skew_tolerance_ms,
         :heartbeat_tracking_mode,
         :heartbeat_reconcile_interval_ms,
         :graceful_shutdown_timeout_ms,
+        :graceful_shutdown_total_timeout_ms,
         :graceful_shutdown_concurrency,
         :supervisor_shutdown_timeout_ms,
         :dead_node_threshold_ms,
@@ -3137,6 +3260,7 @@ defmodule DurableServer.Supervisor do
 
     name = Keyword.fetch!(opts, :name)
     prefix = Keyword.fetch!(opts, :prefix)
+    :ok = claim_prefix!(prefix, name)
 
     # Extract infrastructure options with defaults
     finch = Keyword.get(opts, :finch, DurableServer.Finch)
@@ -3238,6 +3362,13 @@ defmodule DurableServer.Supervisor do
         opts,
         :heartbeat_staleness_threshold_ms,
         @default_heartbeat_staleness_threshold_ms
+      )
+
+    heartbeat_future_skew_tolerance_ms =
+      extract_non_negative_integer!(
+        opts,
+        :heartbeat_future_skew_tolerance_ms,
+        @default_heartbeat_future_skew_tolerance_ms
       )
 
     max_heartbeat_interval = div(heartbeat_staleness_threshold_ms, 2)
@@ -3349,9 +3480,12 @@ defmodule DurableServer.Supervisor do
       restart_claim_gate_disable_after_ms: restart_claim_gate_disable_after_ms,
       heartbeat_interval_ms: heartbeat_interval_ms,
       heartbeat_staleness_threshold_ms: heartbeat_staleness_threshold_ms,
+      heartbeat_future_skew_tolerance_ms: heartbeat_future_skew_tolerance_ms,
       heartbeat_tracking_mode: heartbeat_tracking_mode,
       heartbeat_reconcile_interval_ms: heartbeat_reconcile_interval_ms,
       graceful_shutdown_timeout_ms: Keyword.get(opts, :graceful_shutdown_timeout_ms, 30_000),
+      graceful_shutdown_total_timeout_ms:
+        Keyword.get(opts, :graceful_shutdown_total_timeout_ms, 55_000),
       graceful_shutdown_concurrency: Keyword.get(opts, :graceful_shutdown_concurrency, 50),
       supervisor_shutdown_timeout_ms: Keyword.get(opts, :supervisor_shutdown_timeout_ms, 60_000),
       dead_node_threshold_ms: Keyword.get(opts, :dead_node_threshold_ms, 5 * 60 * 1000),
@@ -3367,10 +3501,23 @@ defmodule DurableServer.Supervisor do
 
     warn_on_shutdown_timeout_mismatch(config, backend_resources)
 
-    Logger.info("starting #{inspect(name)}: #{inspect(config)}")
+    logged_config =
+      config
+      |> Map.drop([
+        :storage_backend,
+        :heartbeat_backend,
+        :object_store,
+        :circuit_breaker,
+        :init_info
+      ])
+      |> Map.put(:storage_backend, config.storage_backend.adapter)
+      |> Map.put(:heartbeat_backend, config.heartbeat_backend.adapter)
+
+    Logger.info("starting #{inspect(name)}: #{inspect(logged_config)}")
 
     :ets.insert(table_name, {:config, config})
     :ets.insert(table_name, {:capacity_limits, capacity_limits})
+    :ets.insert(table_name, {:capacity_count_total, 0})
     :ets.insert(table_name, {:sticky_placement_config, sticky_placement_config})
 
     :ets.insert(
@@ -3563,13 +3710,13 @@ defmodule DurableServer.Supervisor do
 
   defp warn_on_shutdown_timeout_mismatch(config, backend_resources) do
     supervisor_timeout = config.supervisor_shutdown_timeout_ms
-    graceful_timeout = config.graceful_shutdown_timeout_ms
+    graceful_total_timeout = config.graceful_shutdown_total_timeout_ms
 
-    if supervisor_timeout < graceful_timeout do
+    if supervisor_timeout < graceful_total_timeout do
       Logger.warning(
         "supervisor_shutdown_timeout_ms (#{supervisor_timeout}) is less than " <>
-          "graceful_shutdown_timeout_ms (#{graceful_timeout}); the parent supervisor may cut off " <>
-          "DurableServer shutdown before Terminator finishes draining children"
+          "graceful_shutdown_total_timeout_ms (#{graceful_total_timeout}); the parent supervisor " <>
+          "may cut off DurableServer shutdown before Terminator finishes draining children"
       )
     end
 
@@ -3736,9 +3883,9 @@ defmodule DurableServer.Supervisor do
     init_backend!(adapter, raw_opts)
   end
 
-  defp init_backend_spec(spec, _finch, _task_sup) do
+  defp init_backend_spec(_spec, _finch, _task_sup) do
     raise ArgumentError,
-          "invalid :backend option #{inspect(spec)}. Expected {BackendModule, opts} or %DurableServer.StorageBackend{}"
+          "invalid :backend option. Expected {BackendModule, opts} or %DurableServer.StorageBackend{}"
   end
 
   defp prepare_backend_init_opts(
@@ -3784,17 +3931,16 @@ defmodule DurableServer.Supervisor do
       {:ok, %StorageBackend{} = backend} ->
         backend
 
-      {:error, reason} ->
-        raise ArgumentError,
-              "failed to initialize backend #{inspect(adapter)} with #{inspect(raw_opts)}: #{inspect(reason)}"
+      {:error, _reason} ->
+        raise ArgumentError, "failed to initialize backend #{inspect(adapter)}"
     end
   end
 
   defp normalize_backend_opts(opts) when is_list(opts), do: opts
   defp normalize_backend_opts(opts) when is_map(opts), do: Map.to_list(opts)
 
-  defp normalize_backend_opts(other) do
-    raise ArgumentError, "expected backend options as keyword or map, got: #{inspect(other)}"
+  defp normalize_backend_opts(_other) do
+    raise ArgumentError, "expected backend options as keyword or map"
   end
 
   defp maybe_extract_object_store(%StorageBackend{
@@ -3825,8 +3971,11 @@ defmodule DurableServer.Supervisor do
       :infinity ->
         limits
 
+      limit when is_integer(limit) and limit > 0 ->
+        Map.put(limits, :max_children, %{total: limit})
+
       limit when is_integer(limit) ->
-        %{:total => limit}
+        raise ArgumentError, "max_children must be a positive integer, got: #{inspect(limit)}"
 
       limit_map when is_map(limit_map) ->
         validate_max_children_map!(limit_map)

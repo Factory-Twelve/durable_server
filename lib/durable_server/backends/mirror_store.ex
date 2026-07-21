@@ -49,9 +49,9 @@ defmodule DurableServer.Backends.MirrorStore do
                  `-- promote_on_fallback=true
                         |
                         v
-                     put into read_preference
-                        |-- success/conflict-resolved -> return read_preference object
-                        `-- transient failure          -> return {:error, {:promotion_failed, reason}}
+                     claim absent key in read_preference
+                        |-- success/concurrent-create -> return read_preference object
+                        `-- transient failure         -> return {:error, {:promotion_failed, reason}}
   ```
 
   ### Why promotion matters
@@ -391,12 +391,13 @@ defmodule DurableServer.Backends.MirrorStore do
   def unsubscribe(%{} = _state, _subscription_ref), do: :ok
 
   defp promote_fallback_object(read_backend, key, body, read_opts) do
-    # Promote to the read backend so returned etag matches subsequent CAS writes.
-    case StorageBackend.put_object(read_backend, key, body, max_retries: 3) do
-      {:ok, promoted_obj} ->
-        {:ok, promoted_obj}
+    # Promotion is create-if-absent. A writer may create the preferred object
+    # between its initial miss and this fallback read; never overwrite that value.
+    case StorageBackend.try_claim(read_backend, key, body) do
+      {:ok, {:claimed, etag}} ->
+        {:ok, %{body: body, etag: etag}}
 
-      {:error, :conflict} ->
+      {:error, reason} when reason in [:already_claimed, :taken, :conflict] ->
         StorageBackend.get_object(read_backend, key, read_opts)
 
       {:error, reason} ->
