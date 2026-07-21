@@ -28,19 +28,19 @@ defmodule DurableServer.MetaTest do
     assert decoded == %{meta | key: @context.key, prefix: @context.prefix}
   end
 
-  test "rejects an ETF atom that does not already exist without interning it" do
-    atom_name = "durable_meta_untrusted_#{System.unique_integer([:positive, :monotonic])}"
+  test "decodes persisted metadata atoms that do not exist in the current VM" do
+    atom_name = "Elixir.DurableMetaOldNode#{System.unique_integer([:positive, :monotonic])}"
     assert_raise ArgumentError, fn -> String.to_existing_atom(atom_name) end
 
     encoded =
-      <<131, 119, byte_size(atom_name), atom_name::binary>>
+      <<131, 116, 2::unsigned-big-32, 119, 6, "status", 119, 7, "running", 119, 6, "module", 119,
+        byte_size(atom_name), atom_name::binary>>
       |> Base.encode64()
 
-    assert_raise ArgumentError, ~r/unsafe or malformed external term/, fn ->
-      Meta.decode_from_binary(encoded, @context)
-    end
+    decoded = Meta.decode_from_binary(encoded, @context)
 
-    assert_raise ArgumentError, fn -> String.to_existing_atom(atom_name) end
+    assert decoded.module == String.to_existing_atom(atom_name)
+    assert decoded.status == :running
   end
 
   test "rejects executable and malformed external terms with a controlled error" do

@@ -49,7 +49,7 @@ defmodule DurableServer.Meta do
     with :ok <- validate_encoded_size(meta_str),
          {:ok, binary} <- decode_base64(meta_str),
          :ok <- validate_binary_format(binary),
-         {:ok, term} <- decode_safe_term(binary) do
+         {:ok, term} <- decode_term(binary) do
       from_storage_term(term, %{key: key, prefix: prefix})
     else
       {:error, reason} ->
@@ -90,10 +90,15 @@ defmodule DurableServer.Meta do
 
   defp validate_binary_format(_binary), do: {:error, "invalid external term"}
 
-  defp decode_safe_term(binary) do
-    {:ok, :erlang.binary_to_term(binary, [:safe])}
+  # Persisted metadata contains native PIDs and references whose ETF includes
+  # the originating node atom. A replacement VM may not have interned that old
+  # node name yet, so `[:safe]` would make otherwise valid durable state
+  # unreadable after a deploy. Decode the bounded, uncompressed term and then
+  # enforce the metadata shape and allowed term types in `from_storage_term/2`.
+  defp decode_term(binary) do
+    {:ok, :erlang.binary_to_term(binary)}
   rescue
-    _error -> {:error, "unsafe or malformed external term"}
+    _error -> {:error, "malformed external term"}
   end
 
   def encode_to_binary(%Meta{} = meta) do
