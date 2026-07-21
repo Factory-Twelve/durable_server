@@ -3006,5 +3006,38 @@ defmodule DurableServer.LifecycleTest do
 
       GenServer.stop(manager_pid)
     end
+
+    test "lifecycle manager skips cordoned permanent servers", %{
+      supervisor_name: supervisor_name,
+      prefix: prefix,
+      config: config,
+      circuit_breaker: _circuit_breaker
+    } do
+      key = "cordoned-permanent-#{DurableServer.UUID.uuid4()}"
+
+      meta_attrs = %{
+        status: :cordoned,
+        node_str: "dead_node@test",
+        node_ref: "dead-ref",
+        module: TestServer,
+        permanent: true,
+        pid: spawn(fn -> :ok end)
+      }
+
+      create_test_object(config.object_store, "#{prefix}#{key}", %{count: 0}, meta_attrs)
+
+      {:ok, manager_pid} =
+        start_standalone_lifecycle_manager(supervisor_name, config)
+
+      send(manager_pid, :discover_and_restart)
+      wait_for_discovery_completion(manager_pid, 1000)
+
+      {:ok, data} =
+        DurableServer.fetch_stored_state(config.object_store, %{key: key, prefix: prefix})
+
+      assert data.meta.status == :cordoned
+
+      GenServer.stop(manager_pid)
+    end
   end
 end

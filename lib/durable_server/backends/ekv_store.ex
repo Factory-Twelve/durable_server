@@ -97,7 +97,8 @@ defmodule DurableServer.Backends.EKVStore do
        },
        features: %{
          heartbeat_subscribe?: true,
-         list_includes_body?: true
+         list_includes_body?: true,
+         conditional_delete?: true
        }
      }}
   end
@@ -267,6 +268,23 @@ defmodule DurableServer.Backends.EKVStore do
   end
 
   @impl true
+  def delete_object(%{} = state, key, opts) when is_binary(key) and is_list(opts) do
+    opts = Keyword.validate!(opts, [:etag])
+
+    case Keyword.fetch(opts, :etag) do
+      {:ok, etag} ->
+        with_ekv(state, fn ->
+          with {:ok, expected_vsn} <- decode_delete_etag(etag) do
+            do_delete_expected(state, key, expected_vsn, timeout_deadline(state.timeout))
+          end
+        end)
+
+      :error ->
+        delete_object(state, key)
+    end
+  end
+
+  @impl true
   def try_claim(%{} = state, key, body) when is_binary(key) do
     with_ekv(state, fn ->
       with {:ok, encoded_body} <- encode_body(body) do
@@ -408,6 +426,33 @@ defmodule DurableServer.Backends.EKVStore do
 
       {:error, reason} ->
         {:error, reason}
+    end
+  end
+
+  defp do_delete_expected(state, key, expected_vsn, deadline_at) do
+    case remaining_timeout(deadline_at) do
+      timeout when is_integer(timeout) and timeout <= 0 ->
+        {:error, :timeout}
+
+      timeout ->
+        case ekv_delete(state, key,
+               if_vsn: expected_vsn,
+               timeout: timeout,
+               resolve_unconfirmed: true
+             ) do
+          {:ok, _new_vsn} ->
+            :ok
+
+          {:error, :conflict} ->
+            case current_vsn(state, key) do
+              {:ok, nil} -> {:error, :not_found}
+              {:ok, _} -> {:error, :conflict}
+              {:error, reason} -> {:error, reason}
+            end
+
+          {:error, reason} ->
+            {:error, reason}
+        end
     end
   end
 
@@ -634,6 +679,13 @@ defmodule DurableServer.Backends.EKVStore do
     end
   rescue
     _ -> :error
+  end
+
+  defp decode_delete_etag(etag) do
+    case decode_vsn(etag) do
+      {:ok, vsn} -> {:ok, vsn}
+      :error -> {:error, :conflict}
+    end
   end
 
   defp retryable_error?(reason) do

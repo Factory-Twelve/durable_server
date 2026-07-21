@@ -2222,6 +2222,15 @@ defmodule DurableServer.LifecycleManager do
         case fetch_restartable_stored_state(state, key, etag, entry) do
           {:ok, %StoredState{meta: %Meta{} = meta} = obj} ->
             cond do
+              # delete intent suppresses automatic recovery; explicit starts may
+              # CAS-replace an abandoned delete tombstone.
+              Meta.deleting?(meta) ->
+                :skip
+
+              # cordoned servers are administratively blocked from all starts
+              Meta.cordoned?(meta) ->
+                :skip
+
               # never restart permanently crashed servers
               Meta.permanently_crashed?(meta) ->
                 :skip
@@ -2740,6 +2749,9 @@ defmodule DurableServer.LifecycleManager do
       Meta.stopped_permanently?(meta) ->
         :healthy
 
+      Meta.cordoned?(meta) ->
+        :healthy
+
       true ->
         # before taking slow path of checking locks via rpc, first see if server is alive in syn
         case Group.lookup(supervisor_name, meta.key, extract_meta: & &1) do
@@ -2784,6 +2796,9 @@ defmodule DurableServer.LifecycleManager do
       # server explicitly marked as crashed
       Meta.crashed?(meta) ->
         :orphaned
+
+      Meta.cordoned?(meta) ->
+        :healthy
 
       # previous restart attempt has expired
       Meta.restart_attempt_expired?(meta) ->

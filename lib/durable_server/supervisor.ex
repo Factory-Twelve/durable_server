@@ -90,6 +90,11 @@ defmodule DurableServer.Supervisor do
     before the node is considered stale/orphan-claimable (default: 30_000)
   - `:heartbeat_future_skew_tolerance_ms` - Maximum accepted clock lead in a persisted
     cross-node heartbeat (default: 5_000)
+  - `:delete_tombstone_delete_request_margin_ms` - Safety margin added to
+    `:heartbeat_staleness_threshold_ms` before an abandoned delete tombstone may be
+    replaced by an explicit start. Existing delete tombstones are only reused for
+    physical delete while they are outside this margin. Configure this at least as
+    high as the storage backend's maximum delete request duration (default: 30_000)
   - `:heartbeat_tracking_mode` - Heartbeat cache strategy: `:poll` or `:subscribe`.
     Defaults from backend capabilities.
   - `:heartbeat_reconcile_interval_ms` - Full heartbeat cache reconcile interval used
@@ -236,6 +241,7 @@ defmodule DurableServer.Supervisor do
   @default_restart_start_timeout_ms 30_000
   @default_heartbeat_staleness_threshold_ms 30_000
   @default_heartbeat_future_skew_tolerance_ms 5_000
+  @default_delete_tombstone_delete_request_margin_ms 30_000
   @default_restart_claim_preferred_fanout 2
   @default_restart_claim_expanded_fanout 4
   @default_restart_claim_gate_expand_after_ms :timer.seconds(30)
@@ -655,6 +661,8 @@ defmodule DurableServer.Supervisor do
   - `:heartbeat_interval_ms` - Node heartbeat interval (default: 10_000)
   - `:heartbeat_staleness_threshold_ms` - Node heartbeat stale/orphan threshold
     (default: 30_000)
+  - `:delete_tombstone_delete_request_margin_ms` - Delete tombstone physical-delete
+    request safety margin (default: 30_000)
   - `:heartbeat_tracking_mode` - Heartbeat cache strategy: `:poll` or `:subscribe`
   - `:heartbeat_reconcile_interval_ms` - Full heartbeat cache reconcile interval
   - `:graceful_shutdown_timeout_ms` - Per-child graceful shutdown timeout (default: 30_000)
@@ -1387,6 +1395,40 @@ defmodule DurableServer.Supervisor do
   end
 
   defp handle_already_started_race(
+         _supervisor,
+         _module,
+         _init_arg,
+         _boot_info,
+         _key,
+         :deleting,
+         _retries,
+         _deadline_ms,
+         _reply_to
+       ) do
+    {:error, {:already_started, :deleting}}
+  end
+
+  defp handle_already_started_race(
+         supervisor,
+         module,
+         init_arg,
+         boot_info,
+         _key,
+         :noproc,
+         retries,
+         deadline_ms,
+         reply_to
+       ) do
+    do_start_child(
+      supervisor,
+      {module, init_arg, boot_info},
+      retries + 1,
+      deadline_ms,
+      reply_to
+    )
+  end
+
+  defp handle_already_started_race(
          supervisor,
          module,
          init_arg,
@@ -1396,7 +1438,8 @@ defmodule DurableServer.Supervisor do
          retries,
          deadline_ms,
          reply_to
-       ) do
+       )
+       when is_pid(pid) do
     # wait up to 100ms * max retries (2.5s) for metadata to be synced before giving up on retries
     if retries > 0, do: Process.sleep(250)
 
@@ -2305,6 +2348,12 @@ defmodule DurableServer.Supervisor do
        when is_pid(pid),
        do: {:ok, {pid, meta}}
 
+  defp normalize_already_started_result(_supervisor, _key, :deleting, _deadline_ms),
+    do: {:error, {:already_started, :deleting}}
+
+  defp normalize_already_started_result(_supervisor, _key, :noproc, _deadline_ms),
+    do: {:error, {:unreachable, :noproc}}
+
   defp normalize_already_started_result(supervisor, key, pid, deadline_ms) when is_pid(pid) do
     await_group_registration_or_unreachable(
       supervisor,
@@ -2740,6 +2789,43 @@ defmodule DurableServer.Supervisor do
       {pid, _} -> terminate_child_permanent(supervisor_name, pid)
       nil -> {:error, :noproc}
     end
+  end
+
+  @doc """
+  Terminates a DurableServer child and cordons it from future starts.
+
+  A cordoned server stores `status: :cordoned` and is ineligible for both
+  LifecycleManager restarts and explicit `start_child/3` or
+  `ensure_started_child/3` calls until `uncordon_child/2` is called.
+
+  If the server is running, the process performs its final persistence with
+  `status: :cordoned`. If the server is not running but has stored state, this
+  CAS-updates the stored status directly.
+
+  ## Options
+
+  - `:timeout` - maximum time in milliseconds to wait for a running process to
+    stop and confirm the cordon (default: `5000`)
+  """
+  def terminate_and_cordon_child(supervisor, pid_or_key, opts \\ [])
+
+  def terminate_and_cordon_child(supervisor, pid_or_key, opts)
+      when (is_pid(pid_or_key) or is_binary(pid_or_key)) and is_list(opts) do
+    opts = Keyword.validate!(opts, [:timeout])
+    timeout = Keyword.get(opts, :timeout, 5000)
+    config = __get_config__(supervisor)
+    DurableServer.__cordon_request__(supervisor, pid_or_key, timeout, config)
+  end
+
+  @doc """
+  Clears a cordon by changing `status: :cordoned` back to `:stopped_graceful`.
+
+  This makes the server eligible for explicit starts again. If the server is
+  permanent, LifecycleManager may also restart it after the cordon is cleared.
+  """
+  def uncordon_child(supervisor, key) when is_atom(supervisor) and is_binary(key) do
+    config = __get_config__(supervisor)
+    DurableServer.__uncordon_request__(supervisor, key, config)
   end
 
   defp terminate_child_for_rehome(
@@ -3232,6 +3318,7 @@ defmodule DurableServer.Supervisor do
         :heartbeat_interval_ms,
         :heartbeat_staleness_threshold_ms,
         :heartbeat_future_skew_tolerance_ms,
+        :delete_tombstone_delete_request_margin_ms,
         :heartbeat_tracking_mode,
         :heartbeat_reconcile_interval_ms,
         :graceful_shutdown_timeout_ms,
@@ -3371,6 +3458,13 @@ defmodule DurableServer.Supervisor do
         @default_heartbeat_future_skew_tolerance_ms
       )
 
+    delete_tombstone_delete_request_margin_ms =
+      extract_positive_integer!(
+        opts,
+        :delete_tombstone_delete_request_margin_ms,
+        @default_delete_tombstone_delete_request_margin_ms
+      )
+
     max_heartbeat_interval = div(heartbeat_staleness_threshold_ms, 2)
 
     if heartbeat_interval_ms > max_heartbeat_interval do
@@ -3481,6 +3575,7 @@ defmodule DurableServer.Supervisor do
       heartbeat_interval_ms: heartbeat_interval_ms,
       heartbeat_staleness_threshold_ms: heartbeat_staleness_threshold_ms,
       heartbeat_future_skew_tolerance_ms: heartbeat_future_skew_tolerance_ms,
+      delete_tombstone_delete_request_margin_ms: delete_tombstone_delete_request_margin_ms,
       heartbeat_tracking_mode: heartbeat_tracking_mode,
       heartbeat_reconcile_interval_ms: heartbeat_reconcile_interval_ms,
       graceful_shutdown_timeout_ms: Keyword.get(opts, :graceful_shutdown_timeout_ms, 30_000),

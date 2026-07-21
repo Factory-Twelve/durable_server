@@ -30,6 +30,7 @@ defmodule DurableServer.Meta do
   @crashed :crashed
   @permanently_crashed :permanently_crashed
   @deleting :deleting
+  @cordoned :cordoned
 
   @max_metadata_binary_bytes 65_536
   @max_metadata_base64_bytes div(@max_metadata_binary_bytes + 2, 3) * 4
@@ -40,7 +41,8 @@ defmodule DurableServer.Meta do
     @running,
     @crashed,
     @permanently_crashed,
-    @deleting
+    @deleting,
+    @cordoned
   ]
 
   def decode_from_binary(meta_str, %{key: key, prefix: prefix}) when is_binary(meta_str) do
@@ -294,6 +296,10 @@ defmodule DurableServer.Meta do
   def crashed?(%Meta{} = meta), do: meta.status == @crashed
 
   def stopped_graceful?(%Meta{} = meta), do: meta.status == @stopped_graceful
+
+  def deleting?(%Meta{} = meta), do: meta.status == @deleting
+
+  def cordoned?(%Meta{} = meta), do: meta.status == @cordoned
 
   def permanently_crashed?(%Meta{} = meta), do: meta.status == @permanently_crashed
 

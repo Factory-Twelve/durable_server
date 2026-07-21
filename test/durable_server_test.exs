@@ -9,6 +9,7 @@ defmodule DurableServerTest do
   alias DurableServer.Meta
   alias DurableServer.StoredState
   alias DurableServer.ObjectStore
+  alias DurableServer.Backends.MirrorStore
   alias DurableServer.Backends.ObjectStore, as: ObjectStoreBackend
   alias DurableServer.StorageBackend
   alias DurableServer.TestTemporalServer
@@ -189,6 +190,15 @@ defmodule DurableServerTest do
     end)
   end
 
+  defp recorded_delete_opts(table, key) do
+    table
+    |> :ets.tab2list()
+    |> Enum.flat_map(fn
+      {{:delete_call, _call_id}, %{key: ^key, opts: opts}} -> [opts]
+      _ -> []
+    end)
+  end
+
   # Test implementation modules
   defmodule RejectingStartupSyncBackend do
     @behaviour DurableServer.StorageBackend
@@ -265,8 +275,10 @@ defmodule DurableServerTest do
          state: %{
            table: :ets.new(__MODULE__, [:set, :public]),
            owner: Map.get(opts, :owner),
-           after_put: Map.get(opts, :after_put)
-         }
+           after_put: Map.get(opts, :after_put),
+           delete_error: Map.get(opts, :delete_error)
+         },
+         features: %{conditional_delete?: true}
        }}
     end
 
@@ -326,6 +338,10 @@ defmodule DurableServerTest do
     end
 
     @impl true
+    def delete_object(%{delete_error: delete_error}, _key) when not is_nil(delete_error) do
+      {:error, delete_error}
+    end
+
     def delete_object(%{table: table}, key) do
       case :ets.lookup(table, {:delete_override, key}) do
         [{{:delete_override, ^key}, response}] ->
@@ -344,6 +360,40 @@ defmodule DurableServerTest do
     end
 
     @impl true
+    def delete_object(%{delete_error: delete_error}, _key, _opts) when not is_nil(delete_error) do
+      {:error, delete_error}
+    end
+
+    def delete_object(%{table: table, owner: owner}, key, opts) do
+      opts = Keyword.validate!(opts, [:etag])
+      record_delete_call(table, key, opts, owner)
+
+      case :ets.lookup(table, {:delete_override, key}) do
+        [{{:delete_override, ^key}, response}] ->
+          response
+
+        [] ->
+          case Keyword.fetch(opts, :etag) do
+            {:ok, expected_etag} ->
+              case :ets.lookup(table, {:data, key}) do
+                [{{:data, ^key}, %{etag: ^expected_etag}}] ->
+                  :ets.delete(table, {:data, key})
+                  :ok
+
+                [{{:data, ^key}, _value}] ->
+                  {:error, :conflict}
+
+                [] ->
+                  {:error, :not_found}
+              end
+
+            :error ->
+              delete_object(%{table: table}, key)
+          end
+      end
+    end
+
+    @impl true
     def try_claim(%{table: table}, key, body) do
       case :ets.lookup(table, {:data, key}) do
         [] ->
@@ -356,10 +406,10 @@ defmodule DurableServerTest do
     end
 
     @impl true
-    def update_object(%{table: table} = state, key, update_fn, _opts) do
+    def update_object(%{table: _table} = state, key, update_fn, _opts) do
       with {:ok, %{body: body, etag: etag}} <- get_object(state, key, consistent: true),
            {:ok, new_body} <- update_fn.(%{body: body, etag: etag}) do
-        put_object(%{table: table}, key, new_body, etag: etag)
+        put_object(state, key, new_body, etag: etag)
       end
     end
 
@@ -391,6 +441,15 @@ defmodule DurableServerTest do
 
       if is_pid(owner) do
         send(owner, {:consistency_probe_get, key, opts})
+      end
+    end
+
+    defp record_delete_call(table, key, opts, owner) do
+      call_id = System.unique_integer([:positive, :monotonic])
+      :ets.insert(table, {{:delete_call, call_id}, %{key: key, opts: opts}})
+
+      if is_pid(owner) do
+        send(owner, {:consistency_probe_delete, key, opts})
       end
     end
   end
@@ -589,6 +648,75 @@ defmodule DurableServerTest do
     def handle_call(:increment, _from, %{count: count} = state) do
       new_state = %{state | count: count + 1}
       {:reply, count + 1, new_state}
+    end
+  end
+
+  defmodule HandleSyncTestServer do
+    use DurableServer, vsn: 1
+
+    def dump_state(state), do: Map.take(state, [:key, :count, :auto_sync?])
+
+    def load_state(_old_vsn, persisted_state) do
+      persisted_state
+      |> DurableServerTest.atomify_keys()
+      |> Map.put_new(:count, 0)
+      |> Map.put(:test_pid, nil)
+      |> Map.put(:sync_count, 0)
+    end
+
+    def init(init_state, info) do
+      {:ok,
+       %{
+         key: info.key,
+         count: Map.get(init_state, :count, 0),
+         test_pid: Map.get(init_state, :test_pid),
+         sync_count: 0,
+         auto_sync?: Map.get(init_state, :auto_sync?, false)
+       }, auto_sync: Map.get(init_state, :auto_sync?, false)}
+    end
+
+    def handle_sync(info, old_state, new_state) do
+      if is_pid(new_state.test_pid) do
+        send(new_state.test_pid, {:handle_sync, info, old_state, new_state})
+        {:ok, %{new_state | sync_count: new_state.sync_count + 1}}
+      else
+        {:ok, new_state}
+      end
+    end
+
+    def handle_call({:set_test_pid, pid}, _from, state) do
+      {:reply, :ok, %{state | test_pid: pid}}
+    end
+
+    def handle_call(:sync_same, _from, state) do
+      {:reply, :ok, state, :sync}
+    end
+
+    def handle_call(:increment_sync, _from, %{count: count} = state) do
+      new_state = %{state | count: count + 1}
+      {:reply, count + 1, new_state, :sync}
+    end
+
+    def handle_call(:increment_auto, _from, %{count: count} = state) do
+      new_state = %{state | count: count + 1}
+      {:reply, count + 1, new_state}
+    end
+
+    def handle_call(:increment_no_sync, _from, %{count: count} = state) do
+      new_state = %{state | count: count + 1}
+      {:reply, count + 1, new_state}
+    end
+
+    def handle_call(:stop_without_user_state_change, _from, state) do
+      {:stop, :normal, :ok, state}
+    end
+
+    def handle_call(:stop_with_user_state_change, _from, %{count: count} = state) do
+      {:stop, :normal, :ok, %{state | count: count + 1}}
+    end
+
+    def handle_call(:get_state, _from, state) do
+      {:reply, state, state}
     end
   end
 
@@ -1678,6 +1806,138 @@ defmodule DurableServerTest do
       # For now, verify the server continues operating
       assert GenServer.call(pid, :increment_and_sync) == 1
       assert GenServer.call(pid, :get_count) == 1
+    end
+  end
+
+  describe "handle_sync callback" do
+    test "runs inline after an explicit sync writes state and skips noop syncs", %{
+      supervisor_name: supervisor_name,
+      prefix: prefix
+    } do
+      key = "handle-sync-explicit-#{DurableServer.UUID.uuid4()}"
+
+      {:ok, {pid, _meta}} =
+        DurableServer.Supervisor.start_child(
+          supervisor_name,
+          {HandleSyncTestServer, key: key, initial_state: %{count: 0}}
+        )
+
+      assert :ok = GenServer.call(pid, {:set_test_pid, self()})
+
+      assert :ok = GenServer.call(pid, :sync_same)
+      refute_receive {:handle_sync, _info, _old_state, _new_state}, 100
+
+      assert 1 = GenServer.call(pid, :increment_sync)
+      assert_receive {:handle_sync, info, old_state, new_state}, 1_000
+      assert info.status == :running
+      assert info.key == key
+      assert info.supervisor == supervisor_name
+      assert old_state.count == 0
+      assert new_state.count == 1
+      assert new_state.sync_count == 0
+
+      assert %{count: 1, sync_count: 1} = GenServer.call(pid, :get_state)
+
+      assert :ok = GenServer.call(pid, :sync_same)
+      refute_receive {:handle_sync, _info, _old_state, _new_state}, 100
+
+      store = test_object_store()
+      {:ok, persisted_data} = DurableServer.fetch_stored_state(store, %{key: key, prefix: prefix})
+      persisted_state = atomify_keys(persisted_data.state)
+
+      assert persisted_state.count == 1
+      refute Map.has_key?(persisted_state, :sync_count)
+      refute Map.has_key?(persisted_state, :test_pid)
+    end
+
+    test "runs after auto_sync writes state with the pre-callback state", %{
+      supervisor_name: supervisor_name
+    } do
+      key = "handle-sync-auto-#{DurableServer.UUID.uuid4()}"
+
+      {:ok, {pid, _meta}} =
+        DurableServer.Supervisor.start_child(
+          supervisor_name,
+          {HandleSyncTestServer, key: key, initial_state: %{count: 0, auto_sync?: true}}
+        )
+
+      assert :ok = GenServer.call(pid, {:set_test_pid, self()})
+      refute_receive {:handle_sync, _info, _old_state, _new_state}, 100
+
+      assert 1 = GenServer.call(pid, :increment_auto)
+      assert_receive {:handle_sync, info, old_state, new_state}, 1_000
+      assert info.status == :running
+      assert info.key == key
+      assert info.supervisor == supervisor_name
+      assert old_state.count == 0
+      assert new_state.count == 1
+      assert new_state.sync_count == 0
+
+      assert %{count: 1, sync_count: 1} = GenServer.call(pid, :get_state)
+    end
+
+    test "does not run for terminate final status persistence when user state is unchanged", %{
+      supervisor_name: supervisor_name
+    } do
+      key = "handle-sync-terminate-status-only-#{DurableServer.UUID.uuid4()}"
+
+      {:ok, {pid, _meta}} =
+        DurableServer.Supervisor.start_child(
+          supervisor_name,
+          {HandleSyncTestServer, key: key, initial_state: %{count: 0}}
+        )
+
+      ref = Process.monitor(pid)
+      assert :ok = GenServer.call(pid, {:set_test_pid, self()})
+      assert :ok = GenServer.call(pid, :stop_without_user_state_change)
+      assert_receive {:DOWN, ^ref, :process, ^pid, :normal}, 1_000
+      refute_receive {:handle_sync, _info, _old_state, _new_state}, 100
+    end
+
+    test "runs for terminate final persistence when user state changed", %{
+      supervisor_name: supervisor_name
+    } do
+      key = "handle-sync-terminate-state-changed-#{DurableServer.UUID.uuid4()}"
+
+      {:ok, {pid, _meta}} =
+        DurableServer.Supervisor.start_child(
+          supervisor_name,
+          {HandleSyncTestServer, key: key, initial_state: %{count: 0}}
+        )
+
+      ref = Process.monitor(pid)
+      assert :ok = GenServer.call(pid, {:set_test_pid, self()})
+      assert :ok = GenServer.call(pid, :stop_with_user_state_change)
+      assert_receive {:handle_sync, info, old_state, new_state}, 1_000
+      assert info.status == :stopped_graceful
+      assert info.key == key
+      assert info.supervisor == supervisor_name
+      assert old_state.count == 1
+      assert new_state.count == 1
+      assert_receive {:DOWN, ^ref, :process, ^pid, :normal}, 1_000
+    end
+
+    test "marks terminate_and_delete_child final persistence as deleting", %{
+      supervisor_name: supervisor_name
+    } do
+      key = "handle-sync-delete-state-changed-#{DurableServer.UUID.uuid4()}"
+
+      {:ok, {pid, _meta}} =
+        DurableServer.Supervisor.start_child(
+          supervisor_name,
+          {HandleSyncTestServer, key: key, initial_state: %{count: 0}}
+        )
+
+      assert :ok = GenServer.call(pid, {:set_test_pid, self()})
+      assert 1 = GenServer.call(pid, :increment_no_sync)
+      assert :ok = DurableServer.Supervisor.terminate_and_delete_child(supervisor_name, pid)
+
+      assert_receive {:handle_sync, info, old_state, new_state}, 1_000
+      assert info.status == :deleting
+      assert info.key == key
+      assert info.supervisor == supervisor_name
+      assert old_state.count == 1
+      assert new_state.count == 1
     end
   end
 
@@ -3689,6 +3949,600 @@ defmodule DurableServerTest do
       %{supervisor_name: supervisor_name, supervisor_pid: supervisor_pid, prefix: prefix}
     end
 
+    test "terminate_and_cordon_child/2 with PID persists cordoned status and blocks starts",
+         %{
+           supervisor_name: supervisor_name,
+           prefix: prefix
+         } do
+      key = "cordon_pid_#{DurableServer.UUID.uuid4()}"
+
+      {:ok, {server_pid, _meta}} =
+        DurableServer.Supervisor.start_child(
+          supervisor_name,
+          {TestServer, key: key, initial_state: %{count: 7}}
+        )
+
+      ref = Process.monitor(server_pid)
+
+      assert :ok =
+               DurableServer.Supervisor.terminate_and_cordon_child(supervisor_name, server_pid)
+
+      assert_receive {:DOWN, ^ref, :process, ^server_pid, _reason}, 2_000
+
+      store = test_object_store()
+
+      assert {:ok, %StoredState{meta: %Meta{status: :cordoned}}} =
+               DurableServer.fetch_stored_state(
+                 store,
+                 %{key: key, prefix: prefix, supervisor: supervisor_name},
+                 consistent: true
+               )
+
+      assert {:error, :cordoned} =
+               DurableServer.Supervisor.start_child(
+                 supervisor_name,
+                 {TestServer, key: key, initial_state: %{count: 8}}
+               )
+
+      assert {:error, :cordoned} =
+               DurableServer.Supervisor.ensure_started_child(
+                 supervisor_name,
+                 {TestServer, key: key, initial_state: %{count: 8}}
+               )
+    end
+
+    test "terminate_and_cordon_child/2 with key cordons stopped storage and uncordon allows start",
+         %{
+           supervisor_name: supervisor_name,
+           prefix: prefix
+         } do
+      key = "cordon_key_#{DurableServer.UUID.uuid4()}"
+
+      {:ok, {server_pid, _meta}} =
+        DurableServer.Supervisor.start_child(
+          supervisor_name,
+          {TestServer, key: key, initial_state: %{count: 7}}
+        )
+
+      ref = Process.monitor(server_pid)
+      assert :ok = DurableServer.Supervisor.terminate_child(supervisor_name, server_pid)
+      assert_receive {:DOWN, ^ref, :process, ^server_pid, _reason}, 2_000
+
+      store = test_object_store()
+
+      assert {:ok, %StoredState{meta: %Meta{status: :stopped_graceful}}} =
+               DurableServer.fetch_stored_state(
+                 store,
+                 %{key: key, prefix: prefix, supervisor: supervisor_name},
+                 consistent: true
+               )
+
+      assert :ok =
+               DurableServer.Supervisor.terminate_and_cordon_child(supervisor_name, key,
+                 timeout: 5_000
+               )
+
+      assert {:ok, %StoredState{meta: %Meta{status: :cordoned}} = stored_state} =
+               DurableServer.fetch_stored_state(
+                 store,
+                 %{key: key, prefix: prefix, supervisor: supervisor_name},
+                 consistent: true
+               )
+
+      assert {:error, :not_eligible} =
+               DurableServer.claim_restart_attempt(
+                 DurableServer.Supervisor.__get_config__(supervisor_name).storage_backend,
+                 stored_state,
+                 ttl: 10_000
+               )
+
+      assert :ok = DurableServer.Supervisor.uncordon_child(supervisor_name, key)
+
+      assert {:ok, %StoredState{meta: %Meta{status: :stopped_graceful}}} =
+               DurableServer.fetch_stored_state(
+                 store,
+                 %{key: key, prefix: prefix, supervisor: supervisor_name},
+                 consistent: true
+               )
+
+      assert {:ok, {new_pid, _meta}} =
+               DurableServer.Supervisor.start_child(
+                 supervisor_name,
+                 {TestServer, key: key, initial_state: %{count: 8}}
+               )
+
+      refute_process_down(new_pid)
+    end
+
+    test "terminate_and_delete_child/2 with key deletes cordoned storage through tombstone CAS" do
+      parent = self()
+
+      after_put = fn _state, key, data, opts, result ->
+        send(parent, {:consistency_probe_put, key, data, opts, result})
+      end
+
+      {supervisor_name, _supervisor_pid, prefix} =
+        start_test_supervisor(
+          backend: {ConsistencyProbeBackend, owner: self(), after_put: after_put}
+        )
+
+      %{storage_backend: store} = DurableServer.Supervisor.__get_config__(supervisor_name)
+      table = backend_table(store)
+      key = "delete_cordoned_#{DurableServer.UUID.uuid4()}"
+      storage_key = prefix <> key
+
+      cordoned_state = %StoredState{
+        vsn: 1,
+        state: %{count: 7},
+        meta: %Meta{
+          status: :cordoned,
+          module: TestServer,
+          pid: nil,
+          supervisor: supervisor_name,
+          node_ref: nil,
+          node_str: to_string(Node.self()),
+          last_heartbeat_at: System.system_time(:millisecond),
+          crash_history: []
+        }
+      }
+
+      :ets.insert(table, {{:data, storage_key}, %{body: cordoned_state, etag: "cordoned"}})
+
+      assert :ok = DurableServer.Supervisor.terminate_and_delete_child(supervisor_name, key)
+
+      assert_receive {:consistency_probe_put, ^storage_key,
+                      %StoredState{
+                        state: %{},
+                        meta: %Meta{
+                          status: :deleting,
+                          pid: nil,
+                          module: nil,
+                          node_ref: nil,
+                          supervisor: nil
+                        }
+                      }, [etag: "cordoned"], {:ok, %{etag: tombstone_etag}}},
+                     2_000
+
+      assert_receive {:consistency_probe_delete, ^storage_key, [etag: ^tombstone_etag]}, 2_000
+
+      assert {:error, :not_found} =
+               StorageBackend.get_object(store, storage_key, consistent: true)
+    end
+
+    test "terminate_and_cordon_child/2 with key retries when lock pid exits before accepting",
+         %{
+           supervisor_name: supervisor_name,
+           prefix: prefix
+         } do
+      key = "cordon_key_noproc_#{DurableServer.UUID.uuid4()}"
+      storage_key = prefix <> key
+      parent = self()
+
+      fake_owner =
+        spawn(fn ->
+          send(parent, {:fake_owner_ready, self()})
+
+          receive do
+            _message -> :ok
+          end
+        end)
+
+      assert_receive {:fake_owner_ready, ^fake_owner}
+      owner_ref = Process.monitor(fake_owner)
+
+      %{storage_backend: store} = DurableServer.Supervisor.__get_config__(supervisor_name)
+
+      running_state = %StoredState{
+        vsn: 1,
+        state: %{count: 7},
+        meta: %Meta{
+          status: :running,
+          module: TestServer,
+          pid: fake_owner,
+          supervisor: supervisor_name,
+          node_ref: DurableServer.Supervisor.node_ref(supervisor_name),
+          node_str: to_string(Node.self()),
+          last_heartbeat_at: System.system_time(:millisecond),
+          crash_history: []
+        }
+      }
+
+      assert {:ok, _object} = StorageBackend.put_object(store, storage_key, running_state, [])
+
+      assert :ok = DurableServer.Supervisor.terminate_and_cordon_child(supervisor_name, key)
+      assert_receive {:DOWN, ^owner_ref, :process, ^fake_owner, _reason}, 2_000
+
+      assert {:ok, %StoredState{meta: %Meta{status: :cordoned}}} =
+               DurableServer.fetch_stored_state(
+                 store,
+                 %{key: key, prefix: prefix, supervisor: supervisor_name},
+                 consistent: true
+               )
+    end
+
+    test "terminate_and_cordon_child/3 validates options", %{
+      supervisor_name: supervisor_name
+    } do
+      assert_raise ArgumentError, fn ->
+        DurableServer.Supervisor.terminate_and_cordon_child(supervisor_name, "missing",
+          invalid: true
+        )
+      end
+    end
+
+    test "explicit start waits while delete tombstone is inside its lease" do
+      {supervisor_name, _supervisor_pid, prefix} =
+        start_test_supervisor(backend: {ConsistencyProbeBackend, owner: self()})
+
+      %{storage_backend: store} = DurableServer.Supervisor.__get_config__(supervisor_name)
+      key = "delete_tombstone_active_#{DurableServer.UUID.uuid4()}"
+      storage_key = prefix <> key
+
+      deleting_tombstone = %StoredState{
+        vsn: 1,
+        state: %{},
+        meta: %Meta{
+          status: :deleting,
+          pid: nil,
+          supervisor: nil,
+          module: nil,
+          node_ref: nil,
+          node_str: to_string(Node.self()),
+          last_heartbeat_at: System.system_time(:millisecond),
+          crash_history: []
+        }
+      }
+
+      {:ok, %{etag: tombstone_etag}} =
+        StorageBackend.put_object(store, storage_key, deleting_tombstone, [])
+
+      assert {:error, {:already_started, :deleting}} =
+               DurableServer.Supervisor.start_child(
+                 supervisor_name,
+                 {TestServer, key: key, initial_state: %{count: 41}}
+               )
+
+      {:ok, stored_state} =
+        DurableServer.fetch_stored_state(store, %{key: key, prefix: prefix}, consistent: true)
+
+      assert stored_state.etag == tombstone_etag
+      assert stored_state.meta.status == :deleting
+      assert stored_state.meta.supervisor == nil
+    end
+
+    test "ensure_started_child returns a delete tombstone error instead of crashing" do
+      {supervisor_name, _supervisor_pid, prefix} =
+        start_test_supervisor(backend: {ConsistencyProbeBackend, owner: self()})
+
+      %{storage_backend: store} = DurableServer.Supervisor.__get_config__(supervisor_name)
+      key = "delete_tombstone_ensure_#{DurableServer.UUID.uuid4()}"
+      storage_key = prefix <> key
+
+      deleting_tombstone = %StoredState{
+        vsn: 1,
+        state: %{},
+        meta: %Meta{
+          status: :deleting,
+          pid: nil,
+          supervisor: nil,
+          module: nil,
+          node_ref: nil,
+          node_str: to_string(Node.self()),
+          last_heartbeat_at: System.system_time(:millisecond),
+          crash_history: []
+        }
+      }
+
+      {:ok, %{etag: tombstone_etag}} =
+        StorageBackend.put_object(store, storage_key, deleting_tombstone, [])
+
+      assert {:error, {:already_started, :deleting}} =
+               DurableServer.Supervisor.ensure_started_child(
+                 supervisor_name,
+                 {TestServer, key: key, initial_state: %{count: 41}}
+               )
+
+      {:ok, stored_state} =
+        DurableServer.fetch_stored_state(store, %{key: key, prefix: prefix}, consistent: true)
+
+      assert stored_state.etag == tombstone_etag
+      assert stored_state.meta.status == :deleting
+    end
+
+    test "explicit start confirms stale delete tombstone before blocking key reuse" do
+      {supervisor_name, _supervisor_pid, prefix} =
+        start_test_supervisor(backend: {ConsistencyProbeBackend, owner: self()})
+
+      %{storage_backend: store} = DurableServer.Supervisor.__get_config__(supervisor_name)
+      table = backend_table(store)
+      key = "delete_tombstone_stale_#{DurableServer.UUID.uuid4()}"
+      storage_key = prefix <> key
+
+      deleting_tombstone = %StoredState{
+        vsn: 1,
+        state: %{},
+        meta: %Meta{
+          status: :deleting,
+          pid: nil,
+          supervisor: nil,
+          module: nil,
+          node_ref: nil,
+          node_str: to_string(Node.self()),
+          last_heartbeat_at: System.system_time(:millisecond),
+          crash_history: []
+        }
+      }
+
+      put_backend_override(
+        table,
+        storage_key,
+        false,
+        {:ok, %{body: deleting_tombstone, etag: "stale-tombstone-etag"}}
+      )
+
+      {:ok, {pid, _meta}} =
+        DurableServer.Supervisor.start_child(
+          supervisor_name,
+          {TestServer, key: key, initial_state: %{count: 41}}
+        )
+
+      assert 41 = GenServer.call(pid, :get_count)
+      refute_process_down(pid)
+
+      get_opts = recorded_get_opts(table, storage_key)
+      assert [consistent: false] in get_opts
+      assert [consistent: true] in get_opts
+
+      {:ok, stored_state} =
+        DurableServer.fetch_stored_state(store, %{key: key, prefix: prefix}, consistent: true)
+
+      assert stored_state.meta.status == :running
+      assert stored_state.meta.pid == pid
+      assert atomify_keys(stored_state.state).count == 41
+    end
+
+    test "first-claim race against delete tombstone does not report the old pid as live" do
+      {supervisor_name, _supervisor_pid, prefix} =
+        start_test_supervisor(backend: {ConsistencyProbeBackend, owner: self()})
+
+      %{storage_backend: store} = DurableServer.Supervisor.__get_config__(supervisor_name)
+      table = backend_table(store)
+      key = "delete_tombstone_race_#{DurableServer.UUID.uuid4()}"
+      storage_key = prefix <> key
+      old_pid = self()
+
+      deleting_tombstone = %StoredState{
+        vsn: 1,
+        state: %{},
+        meta: %Meta{
+          status: :deleting,
+          pid: old_pid,
+          supervisor: nil,
+          module: nil,
+          node_ref: nil,
+          node_str: to_string(Node.self()),
+          last_heartbeat_at: System.system_time(:millisecond),
+          crash_history: []
+        }
+      }
+
+      :ets.insert(table, {{:data, storage_key}, %{body: deleting_tombstone, etag: "tombstone"}})
+      put_backend_override(table, storage_key, false, {:error, :not_found})
+
+      assert {:error, {:already_started, :deleting}} =
+               DurableServer.Supervisor.start_child(
+                 supervisor_name,
+                 {TestServer, key: key, initial_state: %{count: 41}},
+                 timeout: 10_000
+               )
+    end
+
+    test "first-claim race against expired delete tombstone claims the tombstone" do
+      {supervisor_name, _supervisor_pid, prefix} =
+        start_test_supervisor(backend: {ConsistencyProbeBackend, owner: self()})
+
+      %{storage_backend: store} = DurableServer.Supervisor.__get_config__(supervisor_name)
+      table = backend_table(store)
+      key = "delete_tombstone_expired_race_#{DurableServer.UUID.uuid4()}"
+      storage_key = prefix <> key
+
+      deleting_tombstone = %StoredState{
+        vsn: 1,
+        state: %{},
+        meta: %Meta{
+          status: :deleting,
+          pid: self(),
+          supervisor: nil,
+          module: nil,
+          node_ref: nil,
+          node_str: to_string(Node.self()),
+          last_heartbeat_at: System.system_time(:millisecond) - 120_000,
+          crash_history: []
+        }
+      }
+
+      :ets.insert(table, {{:data, storage_key}, %{body: deleting_tombstone, etag: "tombstone"}})
+      put_backend_override(table, storage_key, false, {:error, :not_found})
+
+      {:ok, {pid, _meta}} =
+        DurableServer.Supervisor.start_child(
+          supervisor_name,
+          {TestServer, key: key, initial_state: %{count: 41}},
+          timeout: 10_000
+        )
+
+      assert 41 = GenServer.call(pid, :get_count)
+      refute_process_down(pid)
+
+      {:ok, stored_state} =
+        DurableServer.fetch_stored_state(store, %{key: key, prefix: prefix}, consistent: true)
+
+      assert stored_state.meta.status == :running
+      assert stored_state.meta.pid == pid
+      assert atomify_keys(stored_state.state).count == 41
+    end
+
+    test "physical delete uses the delete tombstone etag" do
+      {supervisor_name, _supervisor_pid, prefix} =
+        start_test_supervisor(backend: {ConsistencyProbeBackend, owner: self()})
+
+      %{storage_backend: store} = DurableServer.Supervisor.__get_config__(supervisor_name)
+      table = backend_table(store)
+      key = "delete_tombstone_conditional_#{DurableServer.UUID.uuid4()}"
+      storage_key = prefix <> key
+
+      {:ok, {server_pid, _meta}} =
+        DurableServer.Supervisor.start_child(
+          supervisor_name,
+          {TestServer, key: key, initial_state: %{count: 7}}
+        )
+
+      assert :ok =
+               DurableServer.Supervisor.terminate_and_delete_child(supervisor_name, server_pid)
+
+      assert_receive {:consistency_probe_delete, ^storage_key, [etag: tombstone_etag]}, 2_000
+      assert is_binary(tombstone_etag)
+      assert [[etag: ^tombstone_etag]] = recorded_delete_opts(table, storage_key)
+
+      assert {:error, :not_found} =
+               StorageBackend.get_object(store, storage_key, consistent: true)
+    end
+
+    test "stale physical delete cannot remove a replacement after tombstone expiry" do
+      {supervisor_name, _supervisor_pid, prefix} =
+        start_test_supervisor(backend: {ConsistencyProbeBackend, owner: self()})
+
+      %{storage_backend: store} = DurableServer.Supervisor.__get_config__(supervisor_name)
+      table = backend_table(store)
+      key = "delete_tombstone_late_delete_#{DurableServer.UUID.uuid4()}"
+      storage_key = prefix <> key
+
+      deleting_tombstone = %StoredState{
+        vsn: 1,
+        state: %{},
+        meta: %Meta{
+          status: :deleting,
+          pid: nil,
+          supervisor: nil,
+          module: nil,
+          node_ref: nil,
+          node_str: to_string(Node.self()),
+          last_heartbeat_at: System.system_time(:millisecond) - 120_000,
+          crash_history: []
+        }
+      }
+
+      :ets.insert(table, {{:data, storage_key}, %{body: deleting_tombstone, etag: "tombstone"}})
+
+      {:ok, {pid, _meta}} =
+        DurableServer.Supervisor.start_child(
+          supervisor_name,
+          {TestServer, key: key, initial_state: %{count: 41}},
+          timeout: 10_000
+        )
+
+      assert {:error, :conflict} =
+               StorageBackend.delete_object(store, storage_key, etag: "tombstone")
+
+      {:ok, stored_state} =
+        DurableServer.fetch_stored_state(store, %{key: key, prefix: prefix}, consistent: true)
+
+      assert stored_state.meta.status == :running
+      assert stored_state.meta.pid == pid
+      assert atomify_keys(stored_state.state).count == 41
+      refute_process_down(pid)
+    end
+
+    test "explicit delete waits while delete tombstone is inside delete request margin" do
+      {supervisor_name, _supervisor_pid, prefix} =
+        start_test_supervisor(
+          backend: {ConsistencyProbeBackend, owner: self()},
+          delete_tombstone_delete_request_margin_ms: 5_000
+        )
+
+      %{
+        storage_backend: store,
+        heartbeat_staleness_threshold_ms: heartbeat_staleness_threshold_ms,
+        delete_tombstone_delete_request_margin_ms: delete_tombstone_delete_request_margin_ms
+      } = DurableServer.Supervisor.__get_config__(supervisor_name)
+
+      key = "delete_tombstone_margin_#{DurableServer.UUID.uuid4()}"
+      storage_key = prefix <> key
+
+      deleting_tombstone = %StoredState{
+        vsn: 1,
+        state: %{},
+        meta: %Meta{
+          status: :deleting,
+          pid: nil,
+          supervisor: nil,
+          module: nil,
+          node_ref: nil,
+          node_str: to_string(Node.self()),
+          last_heartbeat_at:
+            System.system_time(:millisecond) - heartbeat_staleness_threshold_ms -
+              div(delete_tombstone_delete_request_margin_ms, 2),
+          crash_history: []
+        }
+      }
+
+      {:ok, %{etag: tombstone_etag}} =
+        StorageBackend.put_object(store, storage_key, deleting_tombstone, [])
+
+      assert {:error, {:locked, :deleting}} =
+               DurableServer.Supervisor.terminate_and_delete_child(supervisor_name, key)
+
+      {:ok, stored_state} =
+        DurableServer.fetch_stored_state(store, %{key: key, prefix: prefix}, consistent: true)
+
+      assert stored_state.etag == tombstone_etag
+      assert stored_state.meta.status == :deleting
+      assert stored_state.meta.supervisor == nil
+    end
+
+    test "explicit start replaces expired delete tombstone with initial state" do
+      {supervisor_name, _supervisor_pid, prefix} =
+        start_test_supervisor(backend: {ConsistencyProbeBackend, owner: self()})
+
+      %{storage_backend: store} = DurableServer.Supervisor.__get_config__(supervisor_name)
+      key = "delete_tombstone_expired_#{DurableServer.UUID.uuid4()}"
+      storage_key = prefix <> key
+
+      deleting_tombstone = %StoredState{
+        vsn: 1,
+        state: %{},
+        meta: %Meta{
+          status: :deleting,
+          pid: nil,
+          supervisor: nil,
+          module: nil,
+          node_ref: nil,
+          node_str: to_string(Node.self()),
+          last_heartbeat_at: System.system_time(:millisecond) - 120_000,
+          crash_history: []
+        }
+      }
+
+      {:ok, _object} = StorageBackend.put_object(store, storage_key, deleting_tombstone, [])
+
+      {:ok, {pid, _meta}} =
+        DurableServer.Supervisor.start_child(
+          supervisor_name,
+          {TestServer, key: key, initial_state: %{count: 41}}
+        )
+
+      assert 41 = GenServer.call(pid, :get_count)
+
+      refute_process_down(pid)
+
+      {:ok, stored_state} =
+        DurableServer.fetch_stored_state(store, %{key: key, prefix: prefix}, consistent: true)
+
+      assert stored_state.meta.status == :running
+      assert stored_state.meta.pid == pid
+      assert atomify_keys(stored_state.state).count == 41
+    end
+
     test "terminate_and_delete_child/2 with PID deletes running process and storage", %{
       supervisor_name: supervisor_name,
       prefix: prefix
@@ -3797,6 +4651,53 @@ defmodule DurableServerTest do
       end
     end
 
+    test "terminate_and_delete_child/2 with PID returns storage delete errors" do
+      {supervisor_name, _supervisor_pid, prefix} =
+        start_test_supervisor(
+          backend: {ConsistencyProbeBackend, owner: self(), delete_error: :delete_failed}
+        )
+
+      %{storage_backend: store} = DurableServer.Supervisor.__get_config__(supervisor_name)
+      table = backend_table(store)
+      key = "delete_test_pid_error_#{DurableServer.UUID.uuid4()}"
+      storage_key = prefix <> key
+
+      {:ok, {server_pid, _meta}} =
+        DurableServer.Supervisor.start_child(
+          supervisor_name,
+          {DeleteTestServer, key: key, initial_state: %{}}
+        )
+
+      GenServer.call(server_pid, {:set_test_pid, self()})
+
+      ref = Process.monitor(server_pid)
+
+      assert {:error, :delete_failed} =
+               DurableServer.Supervisor.terminate_and_delete_child(supervisor_name, server_pid)
+
+      assert_receive {:DOWN, ^ref, :process, ^server_pid, _reason}, 2_000
+      assert_receive {:terminate, {:shutdown, :delete}, ^key}
+
+      assert {:ok, stored_state} =
+               DurableServer.fetch_stored_state(
+                 store,
+                 %{key: key, prefix: prefix, supervisor: supervisor_name},
+                 consistent: true
+               )
+
+      assert stored_state.meta.status == :deleting
+
+      [{{:data, ^storage_key}, %{body: raw_stored_state}}] =
+        :ets.lookup(table, {:data, storage_key})
+
+      assert raw_stored_state.state == %{}
+      assert raw_stored_state.meta.status == :deleting
+      assert raw_stored_state.meta.pid == nil
+      assert raw_stored_state.meta.module == nil
+      assert raw_stored_state.meta.node_ref == nil
+      assert raw_stored_state.meta.supervisor == nil
+    end
+
     test "terminate_and_delete_child/2 with key deletes running process and storage", %{
       supervisor_name: supervisor_name,
       prefix: prefix
@@ -3829,6 +4730,41 @@ defmodule DurableServerTest do
 
       # verify terminate was called
       assert_receive {:terminate, _reason, ^key}
+    end
+
+    test "terminate_and_delete_child/2 with key returns live process storage delete errors" do
+      {supervisor_name, _supervisor_pid, prefix} =
+        start_test_supervisor(
+          backend: {ConsistencyProbeBackend, owner: self(), delete_error: :delete_failed}
+        )
+
+      %{storage_backend: store} = DurableServer.Supervisor.__get_config__(supervisor_name)
+      key = "delete_test_key_error_#{DurableServer.UUID.uuid4()}"
+
+      {:ok, {server_pid, _meta}} =
+        DurableServer.Supervisor.start_child(
+          supervisor_name,
+          {DeleteTestServer, key: key, initial_state: %{}}
+        )
+
+      GenServer.call(server_pid, {:set_test_pid, self()})
+
+      ref = Process.monitor(server_pid)
+
+      assert {:error, :delete_failed} =
+               DurableServer.Supervisor.terminate_and_delete_child(supervisor_name, key)
+
+      assert_receive {:DOWN, ^ref, :process, ^server_pid, _reason}, 2_000
+      assert_receive {:terminate, {:shutdown, :delete}, ^key}
+
+      assert {:ok, stored_state} =
+               DurableServer.fetch_stored_state(
+                 store,
+                 %{key: key, prefix: prefix, supervisor: supervisor_name},
+                 consistent: true
+               )
+
+      assert stored_state.meta.status == :deleting
     end
 
     test "terminate_and_delete_child/2 with key when process not running still deletes storage",
@@ -3877,6 +4813,65 @@ defmodule DurableServerTest do
                  supervisor_name,
                  non_existent_key
                )
+    end
+
+    test "terminate_and_delete_child/2 with missing key does not issue stale physical delete" do
+      {supervisor_name, _supervisor_pid, prefix} =
+        start_test_supervisor(backend: {ConsistencyProbeBackend, owner: self()})
+
+      %{storage_backend: store} = DurableServer.Supervisor.__get_config__(supervisor_name)
+      table = backend_table(store)
+      key = "delete_missing_no_physical_#{DurableServer.UUID.uuid4()}"
+      storage_key = prefix <> key
+
+      assert :ok = DurableServer.Supervisor.terminate_and_delete_child(supervisor_name, key)
+      assert [] = recorded_delete_opts(table, storage_key)
+    end
+  end
+
+  describe "mirror backend delete semantics" do
+    test "conditional delete support follows write target and does not delete mirror with foreign etag" do
+      primary_table = :ets.new(:mirror_primary_probe, [:set, :public])
+      secondary_table = :ets.new(:mirror_secondary_probe, [:set, :public])
+
+      primary =
+        StorageBackend.new(
+          ConsistencyProbeBackend,
+          %{table: primary_table, owner: self(), after_put: nil, delete_error: nil},
+          %{},
+          %{conditional_delete?: true}
+        )
+
+      secondary =
+        StorageBackend.new(
+          ConsistencyProbeBackend,
+          %{table: secondary_table, owner: self(), after_put: nil, delete_error: nil},
+          %{},
+          %{}
+        )
+
+      {:ok, mirror} =
+        StorageBackend.init_backend(MirrorStore,
+          primary: primary,
+          secondary: secondary,
+          read_preference: :secondary,
+          write_target: :primary,
+          mirror_writes: true,
+          mirror_mode: :required
+        )
+
+      key = "mirror/delete/#{DurableServer.UUID.uuid4()}"
+
+      assert StorageBackend.supports?(mirror, :conditional_delete?)
+      assert {:ok, %{etag: primary_etag}} = StorageBackend.put_object(primary, key, "primary")
+      assert {:ok, _} = StorageBackend.put_object(secondary, key, "secondary")
+
+      assert :ok = StorageBackend.delete_object(mirror, key, etag: primary_etag)
+
+      assert [[etag: ^primary_etag]] = recorded_delete_opts(primary_table, key)
+      assert [] = recorded_delete_opts(secondary_table, key)
+      assert {:error, :not_found} = StorageBackend.get_object(primary, key)
+      assert {:ok, %{body: "secondary"}} = StorageBackend.get_object(secondary, key)
     end
   end
 

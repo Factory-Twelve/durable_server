@@ -49,6 +49,8 @@ defmodule DurableServer.StorageBackend do
               {:ok, object()} | {:error, term()}
   @callback delete_object(state :: term(), key :: String.t()) ::
               :ok | {:error, term()}
+  @callback delete_object(state :: term(), key :: String.t(), opts :: keyword()) ::
+              :ok | {:error, term()}
   @callback try_claim(state :: term(), key :: String.t(), body :: term()) ::
               {:ok, {:claimed, String.t()}} | {:error, term()}
   @callback update_object(
@@ -70,7 +72,7 @@ defmodule DurableServer.StorageBackend do
   @callback unsubscribe(state :: term(), subscription_ref :: term()) ::
               :ok | {:error, term()}
 
-  @optional_callbacks subscribe: 4, unsubscribe: 2
+  @optional_callbacks delete_object: 3, subscribe: 4, unsubscribe: 2
 
   @known_default_keys [
     :heartbeat_tracking_mode,
@@ -237,6 +239,21 @@ defmodule DurableServer.StorageBackend do
   @spec delete_object(t(), String.t()) :: :ok | {:error, term()}
   def delete_object(%__MODULE__{adapter: adapter, state: state}, key) when is_binary(key) do
     adapter.delete_object(state, key)
+  end
+
+  @spec delete_object(t(), String.t(), keyword()) :: :ok | {:error, term()}
+  def delete_object(%__MODULE__{adapter: adapter, state: state}, key, opts)
+      when is_binary(key) and is_list(opts) do
+    opts = Keyword.validate!(opts, [:etag])
+
+    if function_exported?(adapter, :delete_object, 3) do
+      adapter.delete_object(state, key, opts)
+    else
+      case opts do
+        [] -> adapter.delete_object(state, key)
+        _ -> {:error, :conditional_delete_not_supported}
+      end
+    end
   end
 
   @spec try_claim(t(), String.t(), term()) :: {:ok, {:claimed, String.t()}} | {:error, term()}

@@ -237,12 +237,21 @@ defmodule DurableServer.Backends.MirrorStore do
   def init_backend(opts) when is_list(opts) do
     state = normalize_opts(opts)
     read_backend = backend(state, state.read_preference)
+    write_backend = backend(state, state.write_target)
+
+    features =
+      read_backend
+      |> StorageBackend.features()
+      |> Map.put(
+        :conditional_delete?,
+        StorageBackend.supports?(write_backend, :conditional_delete?)
+      )
 
     {:ok,
      %{
        state: state,
        defaults: StorageBackend.defaults(read_backend),
-       features: StorageBackend.features(read_backend)
+       features: features
      }}
   end
 
@@ -305,12 +314,18 @@ defmodule DurableServer.Backends.MirrorStore do
 
   @impl true
   def delete_object(%{} = state, key) do
+    delete_object(state, key, [])
+  end
+
+  @impl true
+  def delete_object(%{} = state, key, opts) when is_list(opts) do
+    opts = Keyword.validate!(opts, [:etag])
     write_backend = backend(state, state.write_target)
     mirror_backend = backend(state, opposite(state.write_target))
 
-    case StorageBackend.delete_object(write_backend, key) do
+    case StorageBackend.delete_object(write_backend, key, opts) do
       :ok ->
-        case maybe_mirror_delete(state, mirror_backend, key) do
+        case maybe_mirror_delete(state, mirror_backend, key, opts) do
           :ok -> :ok
           {:error, reason} -> {:error, reason}
         end
@@ -428,9 +443,16 @@ defmodule DurableServer.Backends.MirrorStore do
     end
   end
 
-  defp maybe_mirror_delete(%{mirror_writes: false}, _mirror_backend, _key), do: :ok
+  defp maybe_mirror_delete(%{mirror_writes: false}, _mirror_backend, _key, _opts), do: :ok
 
-  defp maybe_mirror_delete(%{} = state, mirror_backend, key) do
+  defp maybe_mirror_delete(%{}, _mirror_backend, _key, opts) when opts != [] do
+    # CAS tokens are backend-local. A conditional physical delete is safe only
+    # against the authoritative write backend; the mirrored tombstone write is
+    # the safe replication of delete intent.
+    :ok
+  end
+
+  defp maybe_mirror_delete(%{} = state, mirror_backend, key, []) do
     case StorageBackend.delete_object(mirror_backend, key) do
       :ok ->
         :ok
