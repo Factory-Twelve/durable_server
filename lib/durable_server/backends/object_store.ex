@@ -64,11 +64,65 @@ defmodule DurableServer.Backends.ObjectStore do
 
   @impl true
   def put_object(%ObjectStore{} = store, key, data, opts) do
-    with {:ok, encoded} <- encode_body(data),
-         {:ok, %{etag: etag}} <- ObjectStore.put_object(store, key, encoded, opts) do
-      {:ok, %{body: data, etag: etag}}
+    with {:ok, encoded} <- encode_body(data) do
+      case ObjectStore.put_object(store, key, encoded, opts) do
+        {:ok, %{etag: etag}} ->
+          {:ok, %{body: data, etag: etag}}
+
+        {:error, :conflict} ->
+          resolve_ambiguous_conditional_put(store, key, data, encoded, opts)
+
+        {:error, reason} ->
+          {:error, reason}
+      end
     end
   end
+
+  # A conditional PUT can commit while its response is lost. A retry with the
+  # old ETag then reports a conflict even though this exact boot wrote the
+  # desired state. Only adopt storage when both ownership and bytes are exact.
+  defp resolve_ambiguous_conditional_put(
+         %ObjectStore{} = store,
+         key,
+         %StoredState{meta: %Meta{} = attempted_meta} = data,
+         encoded,
+         opts
+       ) do
+    if Keyword.has_key?(opts, :etag) do
+      case ObjectStore.get_object(store, key, consistent: true) do
+        {:ok, %{body: ^encoded, etag: etag}} ->
+          with {:ok, %StoredState{meta: %Meta{} = persisted_meta}} <- decode_body(encoded),
+               true <- same_boot_owner?(attempted_meta, persisted_meta) do
+            {:ok, %{body: data, etag: etag}}
+          else
+            _other -> {:error, :conflict}
+          end
+
+        _other ->
+          {:error, :conflict}
+      end
+    else
+      {:error, :conflict}
+    end
+  end
+
+  defp resolve_ambiguous_conditional_put(
+         %ObjectStore{},
+         _key,
+         _data,
+         _encoded,
+         _opts
+       ),
+       do: {:error, :conflict}
+
+  defp same_boot_owner?(
+         %Meta{pid: pid, node_ref: node_ref, node_str: node_str},
+         %Meta{pid: pid, node_ref: node_ref, node_str: node_str}
+       )
+       when is_pid(pid) and not is_nil(node_ref) and is_binary(node_str),
+       do: true
+
+  defp same_boot_owner?(%Meta{}, %Meta{}), do: false
 
   @impl true
   def delete_object(%ObjectStore{} = store, key) do

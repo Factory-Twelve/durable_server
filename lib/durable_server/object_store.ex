@@ -15,6 +15,7 @@ defmodule DurableServer.ObjectStore do
   """
 
   @default_timeout 30_000
+  @default_retry_attempt_timeout 5_000
   @max_iam_xml_bytes 1_048_576
 
   @derive {Inspect, only: []}
@@ -941,6 +942,7 @@ defmodule DurableServer.ObjectStore do
       end
 
     req = new_req(client, consistent: consistent, headers: headers)
+    req = Req.merge(req, receive_timeout: retry_attempt_timeout(timeout))
 
     req_with_retries =
       case Keyword.fetch(opts, :max_retries) do
@@ -992,6 +994,11 @@ defmodule DurableServer.ObjectStore do
   defp within_retry_deadline?(deadline_at) do
     System.monotonic_time(:millisecond) < deadline_at
   end
+
+  defp retry_attempt_timeout(timeout) when is_integer(timeout) and timeout >= 0,
+    do: min(timeout, @default_retry_attempt_timeout)
+
+  defp retry_attempt_timeout(_timeout), do: @default_timeout
 
   defp parse_etag!(%{} = headers_or_attrs) do
     case headers_or_attrs["etag"] || headers_or_attrs["ETag"] do

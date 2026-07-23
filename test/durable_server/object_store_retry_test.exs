@@ -34,6 +34,49 @@ defmodule DurableServer.ObjectStoreRetryTest do
     assert Process.get(responses_key) == [:unexpected_retry]
   end
 
+  test "finite operation deadlines cap each HTTP receive attempt" do
+    parent = self()
+
+    adapter = fn request ->
+      send(parent, {:receive_timeout, request.options.receive_timeout})
+
+      case Process.get(:deadline_responses, [
+             %Req.TransportError{reason: :timeout},
+             %Req.Response{status: 200, headers: %{"etag" => ["retry-etag"]}}
+           ]) do
+        [response_or_error | rest] ->
+          Process.put(:deadline_responses, rest)
+          {request, response_or_error}
+      end
+    end
+
+    assert {:ok, %{etag: "retry-etag"}} =
+             ObjectStore.put_object(store(adapter), "__nodes/test@localhost", "heartbeat",
+               max_retries: 10,
+               timeout: 28_000
+             )
+
+    assert_receive {:receive_timeout, 5_000}
+    assert_receive {:receive_timeout, 5_000}
+  end
+
+  test "an operation deadline below the attempt cap becomes the receive timeout" do
+    parent = self()
+
+    adapter = fn request ->
+      send(parent, {:receive_timeout, request.options.receive_timeout})
+      {request, %Req.Response{status: 200, headers: %{"etag" => ["deadline-etag"]}}}
+    end
+
+    assert {:ok, %{etag: "deadline-etag"}} =
+             ObjectStore.put_object(store(adapter), "__nodes/test@localhost", "heartbeat",
+               max_retries: 0,
+               timeout: 750
+             )
+
+    assert_receive {:receive_timeout, 750}
+  end
+
   defp adapter(responses) when is_list(responses) do
     responses_key = make_ref()
     Process.put(responses_key, responses)
