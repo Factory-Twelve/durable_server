@@ -32,6 +32,7 @@ defmodule DurableServer.ObjectStoreBackendTest do
   test "does not adopt an exact body without a complete boot owner" do
     attempted =
       stored_state(%{value: 2}, %{
+        status: :stopped_graceful,
         pid: nil,
         node_ref: nil,
         node_str: nil
@@ -47,6 +48,59 @@ defmodule DurableServer.ObjectStoreBackendTest do
              )
   end
 
+  test "classifies malformed near-envelopes as persisted corruption" do
+    backend = StorageBackend.new(ObjectStoreBackend, %ObjectStore{})
+
+    malformed = %{
+      "$durable_server_stored_state" => 1,
+      "vsn" => 1,
+      "state" => %{},
+      "meta" => "invalid",
+      "extra" => true
+    }
+
+    assert {:error, {:invalid_persisted_state, %ArgumentError{message: message}}} =
+             StorageBackend.decode(backend, JSON.encode!(malformed))
+
+    assert message == "malformed stored-state envelope"
+  end
+
+  test "writes the exact DurableServer 0.1.4 object-store envelope" do
+    stored = stored_state(%{"value" => 2})
+    encoded_meta = Meta.encode_to_binary(stored.meta)
+
+    assert StoredState.to_object_store_term(stored) == %{
+             "vsn" => 1,
+             "state" => %{"value" => 2},
+             "meta" => encoded_meta
+           }
+
+    backend = StorageBackend.new(ObjectStoreBackend, %ObjectStore{})
+    assert {:ok, encoded} = StorageBackend.encode(backend, stored)
+
+    assert JSON.decode!(encoded) == %{
+             "vsn" => 1,
+             "state" => %{"value" => 2},
+             "meta" => encoded_meta
+           }
+
+    assert {:ok, %StoredState{vsn: 1, state: %{"value" => 2}, meta: decoded_meta}} =
+             StorageBackend.decode(backend, encoded)
+
+    assert decoded_meta == stored.meta
+  end
+
+  test "object-store decoder accepts the EKV discriminator envelope" do
+    stored = stored_state(%{"value" => 2})
+    backend = StorageBackend.new(ObjectStoreBackend, %ObjectStore{})
+    encoded = JSON.encode!(StoredState.to_storage_term(stored))
+
+    assert {:ok, %StoredState{vsn: 1, state: %{"value" => 2}, meta: decoded_meta}} =
+             StorageBackend.decode(backend, encoded)
+
+    assert decoded_meta == stored.meta
+  end
+
   defp stored_state(state, owner_overrides \\ %{}) do
     meta =
       struct!(
@@ -58,7 +112,7 @@ defmodule DurableServer.ObjectStoreBackendTest do
             pid: self(),
             status: :running,
             node_ref: 123,
-            node_str: "test@node"
+            node_str: to_string(node())
           },
           owner_overrides
         )

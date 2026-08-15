@@ -396,22 +396,45 @@ defmodule DurableServer.EKVIntegrationTest do
 
     assert_eventually(fn ->
       case ekv_mod().lookup(ekv_name, "#{prefix}#{key}") do
-        {%{vsn: 1, state: %{count: 5}, meta: meta}, _vsn}
-        when is_map(meta) and not is_struct(meta) ->
-          Map.keys(meta) |> Enum.member?(:status)
+        {%{
+           "$durable_server_stored_state" => 1,
+           "vsn" => 1,
+           "state" => %{count: 5},
+           "meta" => encoded_meta
+         } = envelope, _vsn}
+        when map_size(envelope) == 4 and is_binary(encoded_meta) ->
+          with {:ok, meta_binary} <- Base.decode64(encoded_meta),
+               {:ok, meta} <- DurableServer.Meta.Storage.V1.load_binary(meta_binary) do
+            is_map(meta) and not is_struct(meta) and meta.vsn == 1 and
+              Map.has_key?(meta, :status)
+          else
+            _error -> false
+          end
 
         _ ->
           false
       end
     end)
 
-    {%{} = raw_body, _vsn} = ekv_mod().lookup(ekv_name, "#{prefix}#{key}")
+    {%{
+       "$durable_server_stored_state" => 1,
+       "vsn" => 1,
+       "state" => %{count: 5},
+       "meta" => encoded_meta
+     } = raw_body, _vsn} = ekv_mod().lookup(ekv_name, "#{prefix}#{key}")
 
-    assert Enum.sort(Map.keys(raw_body)) == [:meta, :state, :vsn]
+    assert map_size(raw_body) == 4
+    assert is_binary(encoded_meta)
     refute is_struct(raw_body)
-    refute is_struct(raw_body.meta)
-    refute Map.has_key?(raw_body.meta, :key)
-    refute Map.has_key?(raw_body.meta, :prefix)
+
+    assert {:ok, meta_binary} = Base.decode64(encoded_meta)
+    assert {:ok, decoded_meta} = DurableServer.Meta.Storage.V1.load_binary(meta_binary)
+    assert Enum.sort(Map.keys(decoded_meta)) == Enum.sort(DurableServer.Meta.Storage.V1.fields())
+    assert decoded_meta.vsn == 1
+    assert Map.has_key?(decoded_meta, :status)
+    refute is_struct(decoded_meta)
+    refute Map.has_key?(decoded_meta, :key)
+    refute Map.has_key?(decoded_meta, :prefix)
   end
 
   test "concurrent starts for the same key resolve to a single owner", %{
