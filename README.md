@@ -176,6 +176,13 @@ children = [
 
 If you use EKV backend, add EKV to your app's dependencies.
 
+> **0.1.5 EKV activation gate:** the hardened stored-state envelope is not
+> readable by 0.1.4, and 0.1.5 deliberately rejects the legacy native-metadata
+> EKV envelope. A first deployment must therefore use an empty prefix. To
+> upgrade an existing EKV namespace, stop all old writers and perform an
+> offline migration or cut over to a fresh prefix before starting any 0.1.5
+> writer. Mixed-version rolling deployment is unsupported.
+
 ### Mirror Backend (Object Storage -> EKV)
 
 Use the mirror backend to dual-write while you cut over reads/writes in phases.

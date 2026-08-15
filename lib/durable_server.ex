@@ -1398,7 +1398,7 @@ defmodule DurableServer do
                         {:ok, deleting_data}
 
                       true ->
-                        {:error, {:locked, meta.pid}}
+                        {:error, {:locked, Meta.lock_owner(meta)}}
                     end
 
                   %{body: %StoredState{}, etag: etag} when etag != current_etag ->
@@ -2338,7 +2338,8 @@ defmodule DurableServer do
           current_node_ref = DurableServer.Supervisor.node_ref(supervisor_name)
 
           same_caller? =
-            meta && meta.init_from_ref == from_ref && meta.init_from_pid == from_pid &&
+            meta && Meta.identity_equal?(meta.init_from_ref, from_ref) &&
+              Meta.identity_equal?(meta.init_from_pid, from_pid) &&
               meta.node_str == current_node_str && meta.node_ref == current_node_ref
 
           crashed_with_same_caller? = meta && Meta.permanently_crashed?(meta) && same_caller?
@@ -3474,7 +3475,8 @@ defmodule DurableServer do
   end
 
   defp same_boot_owner?(%DurableServer{} = state, %Meta{} = meta) do
-    meta.pid == state.pid and meta.node_ref == state.node_ref and meta.node_str == state.node_str
+    Meta.identity_equal?(meta.pid, state.pid) and meta.node_ref == state.node_ref and
+      meta.node_str == state.node_str
   end
 
   defp schedule_sync(%__MODULE__{} = state, sync_every_ms \\ nil) do
@@ -3573,11 +3575,10 @@ defmodule DurableServer do
   end
 
   @doc false
-  def check_lock(%Meta{supervisor: sup_name, pid: pid} = meta) do
+  def check_lock(%Meta{supervisor: sup_name} = meta) do
     case check_lock_status(meta) do
       {:error, _reason} ->
-        report_lock_check_result(sup_name, {:locked, pid})
-        {:locked, pid}
+        report_locked_owner(meta, sup_name)
 
       other ->
         other
@@ -3597,6 +3598,10 @@ defmodule DurableServer do
         report_lock_diagnostic(sup_name, :check_lock_deleting)
         delete_tombstone_lock_status(meta)
 
+      not Meta.valid_lock_owner?(meta) ->
+        report_lock_diagnostic(sup_name, :check_lock_invalid_owner)
+        {:error, :invalid_persisted_lock_owner}
+
       Meta.cordoned?(meta) ->
         report_lock_diagnostic(sup_name, :check_lock_cordoned)
         {:locked, :cordoned}
@@ -3608,48 +3613,11 @@ defmodule DurableServer do
 
       # local node - call directly and compare node_refs
       node_str == to_string(node()) ->
-        result = __check_lock__(pid, stored_node_ref, sup_name)
-        report_lock_check_result(sup_name, result)
-        result
+        check_local_lock(meta, pid, stored_node_ref, sup_name)
 
       # remote node, try rpc if we see the node online
       node_str in Enum.map(Node.list(), &to_string/1) ->
-        report_lock_diagnostic(sup_name, :check_lock_rpc_attempt)
-        # remote node - use erpc
-        rpc_result =
-          erpc_call(
-            String.to_existing_atom(node_str),
-            __MODULE__,
-            :__check_lock__,
-            [
-              pid,
-              stored_node_ref,
-              sup_name
-            ]
-          )
-
-        case rpc_result do
-          {:locked, lock_pid} ->
-            report_lock_check_result(sup_name, {:locked, lock_pid})
-            {:locked, lock_pid}
-
-          :expired ->
-            report_lock_check_result(sup_name, :expired)
-            :expired
-
-          # node/network failures - fallback to node health check to check expired status
-          {:error, {:erpc, :noconnection}} ->
-            report_lock_rpc_failure(sup_name, node_str, :noconnection)
-            check_lock_via_node_health(meta)
-
-          {:error, {:erpc, :timeout}} ->
-            report_lock_rpc_failure(sup_name, node_str, :timeout)
-            check_lock_via_node_health(meta)
-
-          {:error, {:erpc, :notsup}} ->
-            report_lock_rpc_failure(sup_name, node_str, :notsup)
-            check_lock_via_node_health(meta)
-        end
+        check_remote_lock(meta, pid, stored_node_ref, sup_name, node_str)
 
       # node isn't known to us, check heartbeat cache to see if node is healthy
       true ->
@@ -3658,28 +3626,65 @@ defmodule DurableServer do
     end
   end
 
+  defp check_local_lock(meta, stored_pid, stored_node_ref, supervisor_name) do
+    local_node = Node.self()
+
+    case Meta.resolve_pid(stored_pid) do
+      pid when is_pid(pid) and node(pid) == local_node ->
+        result = __check_lock__(pid, stored_node_ref, supervisor_name)
+        report_lock_check_result(supervisor_name, result)
+        result
+
+      _unresolved_or_mismatched_pid ->
+        check_lock_via_node_health(meta)
+    end
+  end
+
+  defp check_remote_lock(meta, stored_pid, stored_node_ref, supervisor_name, node_str) do
+    owner_node = String.to_existing_atom(node_str)
+
+    case Meta.resolve_pid(stored_pid) do
+      pid when is_pid(pid) and node(pid) == owner_node ->
+        report_lock_diagnostic(supervisor_name, :check_lock_rpc_attempt)
+
+        owner_node
+        |> erpc_call(__MODULE__, :__check_lock__, [pid, stored_node_ref, supervisor_name])
+        |> handle_remote_lock_result(meta, supervisor_name, node_str)
+
+      _unresolved_or_mismatched_pid ->
+        check_lock_via_node_health(meta)
+    end
+  end
+
+  defp handle_remote_lock_result({:locked, lock_pid}, _meta, supervisor_name, _node_str) do
+    report_lock_check_result(supervisor_name, {:locked, lock_pid})
+    {:locked, lock_pid}
+  end
+
+  defp handle_remote_lock_result(:expired, _meta, supervisor_name, _node_str) do
+    report_lock_check_result(supervisor_name, :expired)
+    :expired
+  end
+
+  defp handle_remote_lock_result({:error, {:erpc, reason}}, meta, supervisor_name, node_str)
+       when reason in [:noconnection, :timeout, :notsup] do
+    report_lock_rpc_failure(supervisor_name, node_str, reason)
+    check_lock_via_node_health(meta)
+  end
+
+  defp handle_remote_lock_result(_unexpected, meta, supervisor_name, _node_str) do
+    report_locked_owner(meta, supervisor_name)
+  end
+
   defp check_lock_via_node_health(%Meta{} = meta) do
-    %Meta{supervisor: sup_name, node_ref: stored_node_ref} = meta
+    %Meta{supervisor: sup_name} = meta
 
     case LifecycleManager.lookup_node_health(meta) do
       # node is alive but not connected, treat as healthy until it goes stale
       # this could be temporary net split where both sides can reach object storage
       # but not eachother
-      {:healthy, %{node_ref: ^stored_node_ref}} ->
-        report_lock_check_result(sup_name, {:locked, meta.pid})
-        {:locked, meta.pid}
-
-      # if node is healhty but has a newer node_ref, the node has been bounced for this
-      # object and the pid is necessarily done, so we treat as expired
-      {:healthy, %{node_ref: new_node_ref}} when new_node_ref > stored_node_ref ->
-        report_lock_check_result(sup_name, :expired)
-        :expired
-
-      # if node is healhty but has an older node_ref, a new node has come online
-      # and placed a lock on this key and our node cache is not yet up to date
-      {:healthy, %{node_ref: new_node_ref}} when new_node_ref < stored_node_ref ->
-        report_lock_check_result(sup_name, {:locked, meta.pid})
-        {:locked, meta.pid}
+      {:healthy, %{node_ref: healthy_node_ref}} ->
+        handle_healthy_node_ref(meta, sup_name, healthy_node_ref)
 
       # A stale local cache view is not strong enough evidence to steal a lock.
       # Confirm against storage heartbeat before expiring the lock.
@@ -3760,7 +3765,7 @@ defmodule DurableServer do
 
   # Fallback when local heartbeat cache returns :unknown - fetch heartbeat directly from storage
   defp check_lock_via_storage_heartbeat(
-         %Meta{supervisor: supervisor_name, node_str: node_str, node_ref: stored_node_ref} = meta
+         %Meta{supervisor: supervisor_name, node_str: node_str} = meta
        ) do
     report_lock_diagnostic(supervisor_name, :check_lock_storage_heartbeat_fetch)
 
@@ -3769,17 +3774,8 @@ defmodule DurableServer do
            node_str,
            consistent: true
          ) do
-      {:healthy, %{node_ref: ^stored_node_ref}} ->
-        report_lock_check_result(supervisor_name, {:locked, meta.pid})
-        {:locked, meta.pid}
-
-      {:healthy, %{node_ref: new_node_ref}} when new_node_ref > stored_node_ref ->
-        report_lock_check_result(supervisor_name, :expired)
-        :expired
-
-      {:healthy, %{node_ref: new_node_ref}} when new_node_ref < stored_node_ref ->
-        report_lock_check_result(supervisor_name, {:locked, meta.pid})
-        {:locked, meta.pid}
+      {:healthy, %{node_ref: healthy_node_ref}} ->
+        handle_healthy_node_ref(meta, supervisor_name, healthy_node_ref)
 
       :stale ->
         report_lock_check_result(supervisor_name, :expired)
@@ -3796,6 +3792,23 @@ defmodule DurableServer do
       {:error, reason} ->
         report_lock_diagnostic(supervisor_name, :check_lock_storage_heartbeat_error)
         {:error, reason}
+    end
+  end
+
+  # Integer node refs are ordered generations, so a strictly newer heartbeat proves
+  # the persisted owner is gone. Legacy binary refs are identity tokens only; equal,
+  # older, or different identities are all fenced conservatively as still locked.
+  defp handle_healthy_node_ref(
+         %Meta{node_ref: stored_node_ref} = meta,
+         supervisor_name,
+         healthy_node_ref
+       ) do
+    if is_integer(healthy_node_ref) and is_integer(stored_node_ref) and
+         healthy_node_ref > stored_node_ref do
+      report_lock_check_result(supervisor_name, :expired)
+      :expired
+    else
+      report_locked_owner(meta, supervisor_name)
     end
   end
 
@@ -3848,6 +3861,12 @@ defmodule DurableServer do
     end
   end
 
+  defp report_locked_owner(%Meta{} = meta, supervisor_name) do
+    result = {:locked, Meta.lock_owner(meta)}
+    report_lock_check_result(supervisor_name, result)
+    result
+  end
+
   defp await_raced_registration_error(
          %DurableServer{} = state,
          %StoredState{} = data,
@@ -3882,11 +3901,11 @@ defmodule DurableServer do
                   {:error, {:already_started, :deleting}}
               end
 
-            is_pid(meta.pid) ->
-              {:error, {:already_started, meta.pid}}
-
             true ->
-              {:error, {:already_started, :noproc}}
+              case Meta.resolve_pid(meta.pid) do
+                pid when is_pid(pid) -> {:error, {:already_started, pid}}
+                nil -> {:error, {:already_started, :noproc}}
+              end
           end
 
         :error ->

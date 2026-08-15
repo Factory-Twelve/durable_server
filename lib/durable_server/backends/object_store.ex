@@ -116,11 +116,11 @@ defmodule DurableServer.Backends.ObjectStore do
        do: {:error, :conflict}
 
   defp same_boot_owner?(
-         %Meta{pid: pid, node_ref: node_ref, node_str: node_str},
-         %Meta{pid: pid, node_ref: node_ref, node_str: node_str}
+         %Meta{pid: attempted_pid, node_ref: node_ref, node_str: node_str},
+         %Meta{pid: persisted_pid, node_ref: node_ref, node_str: node_str}
        )
-       when is_pid(pid) and not is_nil(node_ref) and is_binary(node_str),
-       do: true
+       when is_pid(attempted_pid) and not is_nil(node_ref) and is_binary(node_str),
+       do: Meta.identity_equal?(attempted_pid, persisted_pid)
 
   defp same_boot_owner?(%Meta{}, %Meta{}), do: false
 
@@ -195,12 +195,13 @@ defmodule DurableServer.Backends.ObjectStore do
         {:ok, data}
 
       {:error, reason} ->
-        {:error, reason}
+        {:error, {:invalid_persisted_state, reason}}
     end
   catch
     kind, reason ->
-      {:error, {kind, reason, encoded}}
+      {:error, {:invalid_persisted_state, {kind, reason}}}
   end
 
-  defp decode_body(other), do: {:error, {:error, {:unexpected_encoded_value, other}, other}}
+  defp decode_body(other),
+    do: {:error, {:invalid_persisted_state, {:unexpected_encoded_value, other}}}
 end

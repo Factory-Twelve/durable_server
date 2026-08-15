@@ -1,6 +1,8 @@
 defmodule DurableServer.Meta do
   # represents the object metadata in storage
   alias DurableServer.Meta
+  alias DurableServer.Meta.{ExternalAtom, ExternalIdentity}
+  alias DurableServer.Meta.Storage.{ObjectStoreLegacy, V1}
 
   defstruct vsn: 1,
             module: nil,
@@ -34,6 +36,7 @@ defmodule DurableServer.Meta do
 
   @max_metadata_binary_bytes 65_536
   @max_metadata_base64_bytes div(@max_metadata_binary_bytes + 2, 3) * 4
+  @max_collection_items 4_096
 
   @statuses [
     @stopped_graceful,
@@ -45,12 +48,14 @@ defmodule DurableServer.Meta do
     @cordoned
   ]
 
+  @lock_owner_statuses [@running, @crashed, @permanently_crashed, @cordoned]
+
   def decode_from_binary(meta_str, %{key: key, prefix: prefix}) when is_binary(meta_str) do
     with :ok <- validate_encoded_size(meta_str),
          {:ok, binary} <- decode_base64(meta_str),
          :ok <- validate_binary_format(binary),
-         {:ok, term} <- decode_term(binary) do
-      from_storage_term(term, %{key: key, prefix: prefix})
+         {:ok, term} <- V1.load_binary(binary) do
+      build_meta(term, key, prefix)
     else
       {:error, reason} ->
         raise ArgumentError, to_string(reason)
@@ -64,7 +69,7 @@ defmodule DurableServer.Meta do
     if byte_size(meta_str) <= @max_metadata_base64_bytes do
       :ok
     else
-      {:error, "encoded value exceeds #{@max_metadata_binary_bytes} byte limit"}
+      {:error, "encoded value exceeds #{@max_metadata_base64_bytes} byte limit"}
     end
   end
 
@@ -90,43 +95,43 @@ defmodule DurableServer.Meta do
 
   defp validate_binary_format(_binary), do: {:error, "invalid external term"}
 
-  # Persisted metadata contains native PIDs and references whose ETF includes
-  # the originating node atom. A replacement VM may not have interned that old
-  # node name yet, so `[:safe]` would make otherwise valid durable state
-  # unreadable after a deploy. Decode the bounded, uncompressed term and then
-  # enforce the metadata shape and allowed term types in `from_storage_term/2`.
-  defp decode_term(binary) do
-    {:ok, :erlang.binary_to_term(binary)}
-  rescue
-    _error -> {:error, "malformed external term"}
-  end
-
   def encode_to_binary(%Meta{} = meta) do
-    meta
-    |> to_storage_term()
-    |> :erlang.term_to_binary()
-    |> Base.encode64()
+    {_storage_term, binary} = validated_storage_term(meta)
+
+    encoded = Base.encode64(binary)
+    validate_produced_size!(encoded, @max_metadata_base64_bytes, "encoded metadata")
+    encoded
   end
 
-  def from_storage_term(%Meta{} = meta, context) do
-    meta
-    |> Map.from_struct()
-    |> from_storage_term(context)
+  def encode_to_object_store_binary(%Meta{} = meta) do
+    validate_storage_term!(Map.from_struct(meta))
+
+    binary = ObjectStoreLegacy.dump_binary(meta)
+    validate_produced_size!(binary, @max_metadata_binary_bytes, "metadata external term")
+
+    encoded = Base.encode64(binary)
+    validate_produced_size!(encoded, @max_metadata_base64_bytes, "encoded metadata")
+    encoded
+  end
+
+  def normalize_runtime(%Meta{} = meta, %{key: key, prefix: prefix}) do
+    validate_storage_term!(Map.from_struct(meta))
+    %{meta | key: key, prefix: prefix}
   end
 
   def from_storage_term(meta_map, %{key: key, prefix: prefix}) when is_map(meta_map) do
-    unless safe_metadata_term?(meta_map) do
-      raise ArgumentError, "metadata contains unsupported external terms"
-    end
-
-    valid_keys = Map.keys(Map.from_struct(%Meta{}))
-    meta_map = Map.take(meta_map, valid_keys)
-    validate_storage_term!(meta_map)
-    %{struct!(Meta, meta_map) | key: key, prefix: prefix}
+    meta_map
+    |> V1.load_term()
+    |> build_meta(key, prefix)
   end
 
   def from_storage_term(_term, _context) do
     raise ArgumentError, "invalid meta storage term"
+  end
+
+  defp build_meta(storage_term, key, prefix) do
+    validate_storage_term!(storage_term)
+    %{struct!(Meta, storage_term) | key: key, prefix: prefix}
   end
 
   defp validate_storage_term!(meta) do
@@ -134,16 +139,43 @@ defmodule DurableServer.Meta do
       raise ArgumentError, "metadata is missing required field :status"
     end
 
-    validate_field!(meta, :vsn, &(is_integer(&1) and &1 > 0), "a positive integer")
-    validate_field!(meta, :module, &is_atom/1, "an atom")
+    validate_field!(meta, :vsn, &(&1 == 1), "schema version 1")
+    validate_field!(meta, :module, &valid_nullable_atom?/1, "an atom or unresolved atom")
     validate_field!(meta, :permanent, &is_boolean/1, "a boolean")
-    validate_field!(meta, :pid, &(is_nil(&1) or is_pid(&1)), "a pid or nil")
+    validate_field!(meta, :pid, &valid_pid_identity?/1, "a pid, opaque pid, or nil")
     validate_field!(meta, :status, &(&1 in @statuses), "a supported status")
-    validate_field!(meta, :sticky_placement, &(is_nil(&1) or is_list(&1)), "a list or nil")
-    validate_field!(meta, :sticky_placement_history, &is_list/1, "a list")
-    validate_field!(meta, :supervisor, &(is_nil(&1) or is_atom(&1)), "an atom or nil")
-    validate_field!(meta, :task_supervisor, &(is_nil(&1) or is_atom(&1)), "an atom or nil")
-    validate_field!(meta, :dynamic_supervisor, &(is_nil(&1) or is_atom(&1)), "an atom or nil")
+    validate_field!(meta, :key, &(is_nil(&1) or is_binary(&1)), "a binary or nil")
+    validate_field!(meta, :prefix, &(is_nil(&1) or is_binary(&1)), "a binary or nil")
+
+    validate_field!(
+      meta,
+      :sticky_placement,
+      &valid_sticky_placement?/1,
+      "nil or a list of exact placement entries"
+    )
+
+    validate_field!(
+      meta,
+      :sticky_placement_history,
+      &valid_sticky_placement_history?/1,
+      "a list of exact placement-history entries"
+    )
+
+    validate_field!(meta, :supervisor, &valid_nullable_atom?/1, "an atom or unresolved atom")
+
+    validate_field!(
+      meta,
+      :task_supervisor,
+      &valid_nullable_atom?/1,
+      "an atom or unresolved atom"
+    )
+
+    validate_field!(
+      meta,
+      :dynamic_supervisor,
+      &valid_nullable_atom?/1,
+      "an atom or unresolved atom"
+    )
 
     validate_field!(
       meta,
@@ -161,7 +193,12 @@ defmodule DurableServer.Meta do
       "an integer or nil"
     )
 
-    validate_field!(meta, :crash_history, &is_list/1, "a list")
+    validate_field!(
+      meta,
+      :crash_history,
+      &valid_crash_history?/1,
+      "a list of exact crash-history entries"
+    )
 
     validate_field!(
       meta,
@@ -187,52 +224,180 @@ defmodule DurableServer.Meta do
     validate_field!(
       meta,
       :init_from_ref,
-      &(is_nil(&1) or is_reference(&1)),
-      "a reference or nil"
+      &valid_reference_identity?/1,
+      "a reference, opaque reference, or nil"
     )
 
     validate_field!(
       meta,
       :init_from_pid,
-      &(is_nil(&1) or is_pid(&1)),
-      "a pid or nil"
+      &valid_pid_identity?/1,
+      "a pid, opaque pid, or nil"
     )
+
+    validate_lock_owner!(meta)
 
     :ok
   end
 
+  defp validate_lock_owner!(meta) do
+    if lock_owner_required?(meta) and not valid_lock_owner?(meta) do
+      raise ArgumentError,
+            "invalid metadata lock owner: lock-bearing statuses require a PID on node_str and a non-negative integer or non-empty legacy binary node_ref"
+    end
+  end
+
   defp validate_field!(meta, key, predicate, expected) do
-    value = Map.get(meta, key, Map.fetch!(Map.from_struct(%Meta{}), key))
+    value = Map.get(meta, key, Map.fetch!(metadata_defaults(), key))
 
     unless predicate.(value) do
       raise ArgumentError, "invalid metadata field #{inspect(key)}: expected #{expected}"
     end
   end
 
-  defp safe_metadata_term?(term)
-       when is_atom(term) or is_binary(term) or is_number(term) or is_pid(term) or
-              is_reference(term),
-       do: true
+  defp metadata_defaults, do: Map.from_struct(%Meta{})
 
-  defp safe_metadata_term?(list) when is_list(list), do: Enum.all?(list, &safe_metadata_term?/1)
+  defp valid_sticky_placement?(nil), do: true
 
-  defp safe_metadata_term?(tuple) when is_tuple(tuple) do
-    tuple |> Tuple.to_list() |> Enum.all?(&safe_metadata_term?/1)
+  defp valid_sticky_placement?(placement),
+    do: valid_proper_bounded_list?(placement, &valid_sticky_placement_entry?/1)
+
+  defp valid_sticky_placement_entry?(entry) when is_map(entry) do
+    exact_keys?(entry, [:env_var, :value]) and
+      (is_binary(entry.env_var) or entry.env_var == :any) and
+      (is_binary(entry.value) or is_nil(entry.value) or entry.value == :any)
   end
 
-  defp safe_metadata_term?(map) when is_map(map) do
-    Enum.all?(map, fn {key, value} ->
-      safe_metadata_term?(key) and safe_metadata_term?(value)
-    end)
+  defp valid_sticky_placement_entry?(_entry), do: false
+
+  defp valid_sticky_placement_history?(history),
+    do: valid_proper_bounded_list?(history, &valid_sticky_placement_history_entry?/1)
+
+  defp valid_sticky_placement_history_entry?(%{at: at, placement: placement} = entry) do
+    exact_keys?(entry, [:at, :placement]) and is_integer(at) and
+      valid_sticky_placement?(placement)
   end
 
-  defp safe_metadata_term?(_term), do: false
+  defp valid_sticky_placement_history_entry?(_entry), do: false
+
+  defp valid_crash_history?(history),
+    do: valid_proper_bounded_list?(history, &valid_crash_entry?/1)
+
+  defp valid_crash_entry?(%{timestamp: timestamp, reason: reason} = entry) do
+    optional_exact_keys?(entry, [:timestamp, :reason], [:node_ref]) and is_integer(timestamp) and
+      is_binary(reason) and valid_node_ref?(Map.get(entry, :node_ref))
+  end
+
+  defp valid_crash_entry?(_entry), do: false
+
+  defp valid_node_ref?(node_ref),
+    do: is_nil(node_ref) or is_integer(node_ref) or is_binary(node_ref)
+
+  defp valid_proper_bounded_list?(list, predicate),
+    do: valid_proper_bounded_list?(list, predicate, @max_collection_items)
+
+  defp valid_proper_bounded_list?([], _predicate, _remaining), do: true
+
+  defp valid_proper_bounded_list?([entry | rest], predicate, remaining) when remaining > 0 do
+    predicate.(entry) and valid_proper_bounded_list?(rest, predicate, remaining - 1)
+  end
+
+  defp valid_proper_bounded_list?(_list, _predicate, _remaining), do: false
+
+  defp valid_nullable_atom?(value) when is_atom(value), do: true
+  defp valid_nullable_atom?(%ExternalAtom{} = atom), do: ExternalAtom.valid?(atom)
+  defp valid_nullable_atom?(_value), do: false
+
+  defp valid_pid_identity?(identity) do
+    is_nil(identity) or is_pid(identity) or valid_external_identity?(identity, :pid)
+  end
+
+  defp valid_reference_identity?(identity) do
+    is_nil(identity) or is_reference(identity) or valid_external_identity?(identity, :reference)
+  end
+
+  defp valid_external_identity?(%ExternalIdentity{kind: kind} = identity, kind),
+    do: ExternalIdentity.valid?(identity)
+
+  defp valid_external_identity?(_identity, _kind), do: false
+
+  defp exact_keys?(map, keys) do
+    map_size(map) == length(keys) and Enum.all?(keys, &Map.has_key?(map, &1))
+  end
+
+  defp optional_exact_keys?(map, required_keys, optional_keys) do
+    Enum.all?(required_keys, &Map.has_key?(map, &1)) and
+      Enum.all?(Map.keys(map), &(&1 in required_keys or &1 in optional_keys))
+  end
+
+  defp validate_produced_size!(binary, max_bytes, label) do
+    if byte_size(binary) > max_bytes do
+      raise ArgumentError, "#{label} exceeds #{max_bytes} byte limit"
+    end
+  end
 
   def to_storage_term(%Meta{} = meta) do
-    meta
-    |> Map.from_struct()
-    |> Map.drop([:key, :prefix])
+    {storage_term, _binary} = validated_storage_term(meta)
+    storage_term
   end
+
+  defp validated_storage_term(%Meta{} = meta) do
+    validate_storage_term!(Map.from_struct(meta))
+    storage_term = V1.dump(meta)
+
+    binary = :erlang.term_to_binary(storage_term)
+    validate_produced_size!(binary, @max_metadata_binary_bytes, "metadata external term")
+    {storage_term, binary}
+  end
+
+  def resolve_pid(pid) when is_pid(pid), do: pid
+
+  def resolve_pid(%ExternalIdentity{kind: :pid} = identity),
+    do: ExternalIdentity.resolve(identity)
+
+  def resolve_pid(_identity), do: nil
+
+  def identity_equal?(left, right), do: ExternalIdentity.equal?(left, right)
+
+  def valid_lock_owner?(%Meta{} = meta), do: valid_lock_owner?(Map.from_struct(meta))
+
+  def valid_lock_owner?(meta) when is_map(meta) do
+    if lock_owner_required?(meta) do
+      pid = metadata_value(meta, :pid)
+      node_str = metadata_value(meta, :node_str)
+      node_ref = metadata_value(meta, :node_ref)
+
+      is_binary(node_str) and node_str != "" and valid_lock_node_ref?(node_ref) and
+        identity_node(pid) == node_str
+    else
+      true
+    end
+  end
+
+  def valid_lock_owner?(_term), do: false
+
+  def resolve_module(%Meta{} = meta), do: %{meta | module: resolve_module_atom(meta.module)}
+
+  def lock_owner(%Meta{} = meta), do: resolve_pid(meta.pid) || :noproc
+
+  defp resolve_module_atom(atom) when is_atom(atom), do: atom
+
+  defp resolve_module_atom(%ExternalAtom{} = atom),
+    do: ExternalAtom.resolve_module(atom) || atom
+
+  defp lock_owner_required?(meta),
+    do: metadata_value(meta, :status) in @lock_owner_statuses
+
+  defp metadata_value(meta, key),
+    do: Map.get(meta, key, Map.fetch!(metadata_defaults(), key))
+
+  defp identity_node(pid) when is_pid(pid), do: pid |> node() |> to_string()
+  defp identity_node(%ExternalIdentity{kind: :pid, node: node_str}), do: node_str
+  defp identity_node(_identity), do: nil
+
+  defp valid_lock_node_ref?(node_ref) when is_integer(node_ref), do: node_ref >= 0
+  defp valid_lock_node_ref?(node_ref) when is_binary(node_ref), do: node_ref != ""
+  defp valid_lock_node_ref?(_node_ref), do: false
 
   def running?(%Meta{} = meta) do
     meta.status == @running

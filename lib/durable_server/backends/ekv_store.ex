@@ -3,13 +3,13 @@ defmodule DurableServer.Backends.EKVStore do
 
   @behaviour DurableServer.StorageBackend
 
+  alias DurableServer.Backends.EKVStore.VersionCodec
   alias DurableServer.StoredState
 
   @default_timeout 10_000
   @default_backoff {10, 60}
   @default_cas_retries 5
   @subscribe_ready_timeout_ms 5_000
-
   @valid_state_opts [
     :name,
     :consistent_reads,
@@ -106,7 +106,8 @@ defmodule DurableServer.Backends.EKVStore do
   @impl true
   def ensure_ready(%{} = state) do
     with {:ok, config} <- fetch_config(state, state.name),
-         :ok <- ensure_cas_config(config) do
+         :ok <- ensure_cas_config(config),
+         :ok <- VersionCodec.validate_config(config) do
       :ok
     end
   end
@@ -173,8 +174,9 @@ defmodule DurableServer.Backends.EKVStore do
           {:error, :not_found}
 
         {:ok, {value, vsn}} ->
-          with {:ok, body} <- decode_body(value) do
-            {:ok, %{body: body, etag: encode_vsn(vsn)}}
+          with {:ok, body} <- decode_body(value),
+               {:ok, object} <- object_with_vsn(body, vsn) do
+            {:ok, object}
           end
 
         {:error, reason} ->
@@ -195,23 +197,7 @@ defmodule DurableServer.Backends.EKVStore do
       :ok ->
         case if(include_objects, do: ekv_scan(state, prefix), else: ekv_keys(state, prefix)) do
           {:ok, entries} ->
-            if include_objects do
-              Stream.transform(entries, :ok, fn
-                {key, value, vsn}, :ok ->
-                  case decode_body(value) do
-                    {:ok, body} ->
-                      {[%{key: key, etag: encode_vsn(vsn), body: body}], :ok}
-
-                    {:error, reason} ->
-                      case error_handler.({:decode_failed, key, reason}) do
-                        :halt -> {:halt, :ok}
-                        _ -> {[], :ok}
-                      end
-                  end
-              end)
-            else
-              Stream.map(entries, fn {key, vsn} -> %{key: key, etag: encode_vsn(vsn)} end)
-            end
+            list_entries(entries, include_objects, error_handler)
 
           {:error, reason} ->
             case error_handler.(reason) do
@@ -239,7 +225,7 @@ defmodule DurableServer.Backends.EKVStore do
       with {:ok, encoded_data} <- encode_body(data) do
         case Keyword.fetch(opts, :etag) do
           {:ok, etag} ->
-            case decode_vsn(etag) do
+            case VersionCodec.decode(etag) do
               {:ok, expected_vsn} ->
                 do_put_with_expected_vsn(state, key, encoded_data, data, expected_vsn,
                   retries: Keyword.get(opts, :max_retries, 0),
@@ -274,7 +260,7 @@ defmodule DurableServer.Backends.EKVStore do
     case Keyword.fetch(opts, :etag) do
       {:ok, etag} ->
         with_ekv(state, fn ->
-          with {:ok, expected_vsn} <- decode_delete_etag(etag) do
+          with {:ok, expected_vsn} <- VersionCodec.decode_delete_etag(etag) do
             do_delete_expected(state, key, expected_vsn, timeout_deadline(state.timeout))
           end
         end)
@@ -294,7 +280,9 @@ defmodule DurableServer.Backends.EKVStore do
                resolve_unconfirmed: true
              ) do
           {:ok, vsn} ->
-            {:ok, {:claimed, encode_vsn(vsn)}}
+            with {:ok, etag} <- VersionCodec.encode(vsn) do
+              {:ok, {:claimed, etag}}
+            end
 
           {:error, :conflict} ->
             {:error, :already_claimed}
@@ -507,7 +495,7 @@ defmodule DurableServer.Backends.EKVStore do
                resolve_unconfirmed: true
              ) do
           {:ok, vsn} ->
-            {:ok, %{etag: encode_vsn(vsn), body: data}}
+            object_with_vsn(data, vsn)
 
           {:error, :conflict} ->
             {:error, :conflict}
@@ -559,7 +547,7 @@ defmodule DurableServer.Backends.EKVStore do
                resolve_unconfirmed: true
              ) do
           {:ok, _new_value, vsn} ->
-            {:ok, %{etag: encode_vsn(vsn), body: data}}
+            object_with_vsn(data, vsn)
 
           {:error, :conflict} when attempt < retries ->
             sleep_with_deadline(state.backoff, deadline_at, attempt)
@@ -663,30 +651,45 @@ defmodule DurableServer.Backends.EKVStore do
     ])
   end
 
-  defp encode_vsn(vsn) do
-    vsn
-    |> :erlang.term_to_binary()
-    |> Base.url_encode64(padding: false)
+  defp object_with_vsn(body, vsn) do
+    with {:ok, etag} <- VersionCodec.encode(vsn) do
+      {:ok, %{body: body, etag: etag}}
+    end
   end
 
-  defp decode_vsn(etag) when is_binary(etag) do
-    with {:ok, bin} <- Base.url_decode64(etag, padding: false),
-         {ts, origin} <- :erlang.binary_to_term(bin),
-         true <- is_integer(ts) do
-      {:ok, {ts, origin}}
+  defp list_entries(entries, include_objects, error_handler) do
+    Stream.transform(entries, :ok, fn entry, :ok ->
+      case decode_list_entry(entry, include_objects) do
+        {:ok, object} ->
+          {[object], :ok}
+
+        {:error, key, reason} ->
+          case error_handler.({:decode_failed, key, reason}) do
+            :halt -> {:halt, :ok}
+            _other -> {[], :ok}
+          end
+      end
+    end)
+  end
+
+  defp decode_list_entry({key, value, vsn}, true) when is_binary(key) do
+    with {:ok, body} <- decode_body(value),
+         {:ok, object} <- object_with_vsn(body, vsn) do
+      {:ok, Map.put(object, :key, key)}
     else
-      _ -> :error
+      {:error, reason} -> {:error, key, reason}
     end
-  rescue
-    _ -> :error
   end
 
-  defp decode_delete_etag(etag) do
-    case decode_vsn(etag) do
-      {:ok, vsn} -> {:ok, vsn}
-      :error -> {:error, :conflict}
+  defp decode_list_entry({key, vsn}, false) when is_binary(key) do
+    case VersionCodec.encode(vsn) do
+      {:ok, etag} -> {:ok, %{key: key, etag: etag}}
+      {:error, reason} -> {:error, key, reason}
     end
   end
+
+  defp decode_list_entry(entry, _include_objects),
+    do: {:error, :unknown, {:unexpected_list_entry, entry}}
 
   defp retryable_error?(reason) do
     reason in [
@@ -824,7 +827,7 @@ defmodule DurableServer.Backends.EKVStore do
     case StoredState.from_storage_term(value) do
       {:ok, stored_state} -> {:ok, stored_state}
       :not_stored_state -> {:ok, value}
-      {:error, reason} -> {:error, reason}
+      {:error, reason} -> {:error, {:invalid_persisted_state, reason}}
     end
   end
 

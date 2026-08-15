@@ -2387,6 +2387,23 @@ defmodule DurableServerTest do
   end
 
   describe "lock mechanism" do
+    test "malformed persisted ownership is fenced conservatively", %{
+      supervisor_name: supervisor_name
+    } do
+      malformed = %DurableServer.Meta{
+        status: :running,
+        supervisor: supervisor_name,
+        pid: nil,
+        node_str: nil,
+        node_ref: nil
+      }
+
+      assert {:error, :invalid_persisted_lock_owner} =
+               DurableServer.check_lock_status(malformed)
+
+      assert {:locked, :noproc} = DurableServer.check_lock(malformed, supervisor_name)
+    end
+
     test "__check_lock__/3 returns :locked for alive process with matching node_ref", %{
       supervisor_name: supervisor_name,
       prefix: _prefix
@@ -3527,7 +3544,7 @@ defmodule DurableServerTest do
       # Manually create a permanently crashed object
       store = test_object_store()
       # Create properly encoded metadata
-      meta_map = %{
+      meta = %Meta{
         status: :permanently_crashed,
         crash_history: [
           %{timestamp: System.system_time(:millisecond) - 1000, reason: "crash"}
@@ -3542,7 +3559,7 @@ defmodule DurableServerTest do
         pid: spawn(fn -> :ok end)
       }
 
-      encoded_meta = meta_map |> :erlang.term_to_binary() |> Base.encode64()
+      encoded_meta = Meta.encode_to_binary(normalize_test_lock_owner(meta))
 
       crashed_data = %{
         "vsn" => 1,

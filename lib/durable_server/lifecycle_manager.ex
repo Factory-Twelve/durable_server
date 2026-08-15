@@ -2221,6 +2221,9 @@ defmodule DurableServer.LifecycleManager do
       nil ->
         case fetch_restartable_stored_state(state, key, etag, entry) do
           {:ok, %StoredState{meta: %Meta{} = meta} = obj} ->
+            meta = Meta.resolve_module(meta)
+            obj = %{obj | meta: meta}
+
             cond do
               # delete intent suppresses automatic recovery; explicit starts may
               # CAS-replace an abandoned delete tombstone.
@@ -2244,7 +2247,7 @@ defmodule DurableServer.LifecycleManager do
                 :skip
 
               # do not attempt to start modules that no longer exist
-              not Code.ensure_loaded?(meta.module) ->
+              not is_atom(meta.module) or not Code.ensure_loaded?(meta.module) ->
                 Logger.warning(
                   "permanent durable server module #{inspect(meta.module)} not loaded"
                 )
@@ -2279,10 +2282,11 @@ defmodule DurableServer.LifecycleManager do
                 end
             end
 
-          {:error, {kind, _, _encoded}} when kind in [:error, :throw, :exit] ->
-            # decode/parse failure — deterministic for same body, safe to cache
+          {:error, {:invalid_persisted_state, reason}} ->
+            # Invalid persisted data is deterministic for the same object body.
+            # Cache it until its etag changes.
             log(state, :warning, fn ->
-              "Failed to decode stored state for key #{key}: #{inspect(kind)}"
+              "Failed to decode stored state for key #{key}: #{inspect(reason)}"
             end)
 
             :skip
@@ -2305,7 +2309,7 @@ defmodule DurableServer.LifecycleManager do
          %{body: %StoredState{} = stored_state}
        )
        when is_binary(key) and is_binary(etag) do
-    {:ok, attach_listed_stored_state_context(stored_state, key, state.prefix, etag)}
+    {:ok, attach_listed_stored_state_context(stored_state, key, state, etag)}
   end
 
   defp fetch_restartable_stored_state(
@@ -2350,7 +2354,7 @@ defmodule DurableServer.LifecycleManager do
   defp attach_listed_stored_state_context(
          %StoredState{meta: %Meta{} = meta} = stored_state,
          key,
-         prefix,
+         %LifecycleManager{prefix: prefix, supervisor_name: supervisor_name},
          etag
        )
        when is_binary(key) and is_binary(prefix) and is_binary(etag) do
@@ -2359,7 +2363,7 @@ defmodule DurableServer.LifecycleManager do
       | key: key,
         prefix: prefix,
         etag: etag,
-        meta: %{meta | key: key, prefix: prefix}
+        meta: %{meta | key: key, prefix: prefix, supervisor: supervisor_name}
     }
   end
 

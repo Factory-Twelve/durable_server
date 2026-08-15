@@ -915,7 +915,7 @@ defmodule DurableServer.LifecycleTest do
           permanent: true
       }
 
-      encoded_meta = Meta.encode_to_binary(crashed_meta)
+      encoded_meta = Meta.encode_to_binary(normalize_test_lock_owner(crashed_meta))
       updated_data = %{data | meta: encoded_meta}
 
       {:ok, _} =
@@ -988,6 +988,8 @@ defmodule DurableServer.LifecycleTest do
         }
       }
 
+      stored_state = %{stored_state | meta: normalize_test_lock_owner(stored_state.meta)}
+
       assert {:ok, _} =
                DurableServer.StorageBackend.put_object(
                  backend,
@@ -1018,7 +1020,7 @@ defmodule DurableServer.LifecycleTest do
       stale_timestamp = now - 60_000
       :ets.insert(heartbeat_table, {node_str, node_ref, stale_timestamp, %{}, %{}, %{}, nil})
 
-      assert {:locked, ^pid} = DurableServer.check_lock(stored_state.meta)
+      assert {:locked, :noproc} = DurableServer.check_lock(stored_state.meta)
 
       assert {:error, :not_eligible} =
                DurableServer.claim_restart_attempt(backend, stored_state, ttl: 10_000)
@@ -1053,6 +1055,8 @@ defmodule DurableServer.LifecycleTest do
         }
       }
 
+      stored_state = %{stored_state | meta: normalize_test_lock_owner(stored_state.meta)}
+
       assert {:ok, _} =
                DurableServer.StorageBackend.put_object(
                  backend,
@@ -1079,7 +1083,7 @@ defmodule DurableServer.LifecycleTest do
                  heartbeat_data
                )
 
-      assert {:locked, ^pid} = DurableServer.check_lock(stored_state.meta)
+      assert {:locked, :noproc} = DurableServer.check_lock(stored_state.meta)
 
       assert {:error, :not_eligible} =
                DurableServer.claim_restart_attempt(backend, stored_state, ttl: 10_000)
@@ -1130,6 +1134,8 @@ defmodule DurableServer.LifecycleTest do
           last_heartbeat_at: now - 60_000
         }
       }
+
+      stored_state = %{stored_state | meta: normalize_test_lock_owner(stored_state.meta)}
 
       assert {:ok, %{etag: etag}} =
                DurableServer.StorageBackend.put_object(
@@ -1198,6 +1204,8 @@ defmodule DurableServer.LifecycleTest do
           last_heartbeat_at: now - 60_000
         }
       }
+
+      stored_state = %{stored_state | meta: normalize_test_lock_owner(stored_state.meta)}
 
       assert {:ok, _} =
                DurableServer.StorageBackend.put_object(
@@ -1290,7 +1298,7 @@ defmodule DurableServer.LifecycleTest do
           permanent: true
       }
 
-      encoded_meta = Meta.encode_to_binary(crashed_meta)
+      encoded_meta = Meta.encode_to_binary(normalize_test_lock_owner(crashed_meta))
       updated_data = %{data | meta: encoded_meta}
       ObjectStore.put_object(store, "#{prefix}#{key}", encode_legacy_stored_state(updated_data))
 
@@ -1362,7 +1370,7 @@ defmodule DurableServer.LifecycleTest do
           permanent: true
       }
 
-      encoded_meta = Meta.encode_to_binary(crashed_meta)
+      encoded_meta = Meta.encode_to_binary(normalize_test_lock_owner(crashed_meta))
       final_data = %{current_data | meta: encoded_meta}
 
       {:ok, %{etag: _}} =
@@ -1556,7 +1564,7 @@ defmodule DurableServer.LifecycleTest do
       GenServer.stop(manager_pid)
     end
 
-    test "recovery from corrupted restart attempt metadata", %{
+    test "discovery isolates corrupted restart attempt metadata", %{
       supervisor_name: supervisor_name,
       prefix: prefix,
       config: config,
@@ -1579,20 +1587,33 @@ defmodule DurableServer.LifecycleTest do
         restart_attempt_ttl: "invalid_ttl"
       }
 
-      create_test_object(config.object_store, "#{prefix}#{key}", %{count: 0}, meta_attrs)
+      create_invalid_test_object(
+        config.object_store,
+        "#{prefix}#{key}",
+        %{count: 0},
+        meta_attrs
+      )
 
       {:ok, manager_pid} =
         start_standalone_lifecycle_manager(supervisor_name, config)
 
+      manager_state = :sys.get_state(manager_pid)
+
       # Should handle corrupted metadata gracefully
       send(manager_pid, :discover_and_restart)
-      wait_for_discovery_completion(manager_pid, 1500)
+
+      assert_eventually(fn ->
+        match?(
+          [{^key, _etag, :skip, _cached_at}],
+          :ets.lookup(manager_state.discovery_skip_table, key)
+        )
+      end)
 
       # Manager should still be alive despite corrupted data
       assert_process_alive(manager_pid)
 
       # Corrupt typed fields are rejected as data errors rather than admitted into Meta.
-      assert {:error, %ArgumentError{message: message}} =
+      assert {:error, {:invalid_persisted_state, %ArgumentError{message: message}}} =
                DurableServer.fetch_stored_state(config.object_store, %{key: key, prefix: prefix})
 
       assert message =~ "invalid metadata field :restart_attempt_time"
@@ -1725,8 +1746,27 @@ defmodule DurableServer.LifecycleTest do
 
   # Helper to create properly encoded test objects like DurableServer does
   defp create_test_object(%ObjectStore{} = store, key, state, meta_attrs) do
-    encoded_meta = Meta.encode_to_binary(struct!(Meta, meta_attrs))
+    meta = Meta |> struct!(meta_attrs) |> normalize_test_lock_owner()
+    encoded_meta = Meta.encode_to_binary(meta)
 
+    put_test_object(store, key, state, encoded_meta)
+  end
+
+  # Corruption-recovery tests must bypass the validated production encoder so
+  # they can exercise malformed persisted data deliberately.
+  defp create_invalid_test_object(%ObjectStore{} = store, key, state, meta_attrs) do
+    encoded_meta =
+      Meta
+      |> struct!(meta_attrs)
+      |> Map.from_struct()
+      |> Map.drop([:key, :prefix])
+      |> :erlang.term_to_binary()
+      |> Base.encode64()
+
+    put_test_object(store, key, state, encoded_meta)
+  end
+
+  defp put_test_object(%ObjectStore{} = store, key, state, encoded_meta) do
     test_data = %{
       vsn: 1,
       state: state,

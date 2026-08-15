@@ -41,12 +41,15 @@ defmodule DurableServer.MixProject do
   defp deps do
     [
       {:group, "~> 0.2.0"},
-      {:req, "~> 0.5"},
-      {:req_s3, "~> 0.2"},
+      {:req, "~> 0.6.3"},
+      {:req_s3, "~> 0.2.5"},
       {:finch, "~> 0.18"},
       {:sweet_xml, "~> 0.7"},
       {:ex_doc, "~> 0.30", only: :dev, runtime: false},
-      {:ekv, "~> 0.4.0", optional: true}
+      {:ekv,
+       git: "https://github.com/Factory-Twelve/ekv.git",
+       ref: "db3be73035b207a6048430aa3db49cd191165c18",
+       optional: true}
     ]
   end
 end
