@@ -104,7 +104,11 @@ defmodule DurableServer.StoredState do
 
   defp malformed_envelope?(term) do
     Map.has_key?(term, @envelope_marker) or
-      Enum.all?(["vsn", "state", "meta"], &Map.has_key?(term, &1)) or
-      Enum.all?([:vsn, :state, :meta], &Map.has_key?(term, &1))
+      exact_legacy_envelope_shape?(term, ["vsn", "state", "meta"]) or
+      exact_legacy_envelope_shape?(term, [:vsn, :state, :meta])
+  end
+
+  defp exact_legacy_envelope_shape?(term, keys) do
+    map_size(term) == length(keys) and Enum.all?(keys, &Map.has_key?(term, &1))
   end
 end

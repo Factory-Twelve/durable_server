@@ -65,6 +65,19 @@ defmodule DurableServer.ObjectStoreBackendTest do
     assert message == "malformed stored-state envelope"
   end
 
+  test "preserves user maps that contain legacy envelope keys plus application data" do
+    backend = StorageBackend.new(ObjectStoreBackend, %ObjectStore{})
+
+    user_state = %{
+      "vsn" => 7,
+      "state" => %{"nested" => true},
+      "meta" => %{"source" => "application"},
+      "extra" => true
+    }
+
+    assert {:ok, ^user_state} = StorageBackend.decode(backend, JSON.encode!(user_state))
+  end
+
   test "writes the exact DurableServer 0.1.4 object-store envelope" do
     stored = stored_state(%{"value" => 2})
     encoded_meta = Meta.encode_to_binary(stored.meta)

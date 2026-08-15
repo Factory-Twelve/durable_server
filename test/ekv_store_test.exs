@@ -304,6 +304,24 @@ defmodule DurableServer.EKVStoreTest do
     end
   end
 
+  test "EKV preserves user maps that contain legacy envelope keys plus application data", %{
+    backend: backend
+  } do
+    user_states = [
+      %{vsn: 7, state: %{nested: true}, meta: %{source: :application}, extra: true},
+      %{
+        "vsn" => 7,
+        "state" => %{"nested" => true},
+        "meta" => %{"source" => "application"},
+        "extra" => true
+      }
+    ]
+
+    for user_state <- user_states do
+      assert {:ok, ^user_state} = StorageBackend.decode(backend, user_state)
+    end
+  end
+
   test "rejects malformed and noncanonical ETags before put or delete CAS", %{
     backend: backend,
     name: name
