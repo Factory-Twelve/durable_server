@@ -92,7 +92,6 @@ defmodule DurableServer.SafeETFTest do
     node = small_atom("safe_etf_unknown_node_#{System.unique_integer([:positive])}")
 
     invalid_identities = [
-      {:pid, <<103, node::binary, 0x10000000::unsigned-big-32, 0::unsigned-big-32, 0>>},
       {:pid, <<103, node::binary, 0::unsigned-big-32, 0::unsigned-big-32, 4>>},
       {:reference, <<101, node::binary, 0x00040000::unsigned-big-32, 0>>},
       {:reference, <<101, node::binary, 0::unsigned-big-32, 4>>},
@@ -113,10 +112,17 @@ defmodule DurableServer.SafeETFTest do
     node_name = "safe_etf_modern_node_#{System.unique_integer([:positive, :monotonic])}"
     node = small_atom(node_name)
 
+    legacy_pid =
+      <<103, node::binary, 0xF0000001::unsigned-big-32, 0x80000002::unsigned-big-32, 0>>
+
+    zero_word_reference = <<90, 0::unsigned-big-16, node::binary, 0xFFFFFFFF::unsigned-big-32>>
+
     identities = [
+      {:pid, legacy_pid},
       {:pid,
        <<88, node::binary, 0xF0000001::unsigned-big-32, 0x80000002::unsigned-big-32,
          0xFFFFFFFF::unsigned-big-32>>},
+      {:reference, zero_word_reference},
       {:reference,
        <<90, 1::unsigned-big-16, node::binary, 0xFFFFFFFF::unsigned-big-32,
          0x80000001::unsigned-big-32>>}
@@ -132,6 +138,38 @@ defmodule DurableServer.SafeETFTest do
                etf: <<131, ^identity::binary>>
              } = unresolved
     end
+
+    assert is_pid(:erlang.binary_to_term(<<131, legacy_pid::binary>>))
+    assert is_reference(:erlang.binary_to_term(<<131, zero_word_reference::binary>>))
+  end
+
+  test "counts UTF-8 atom limits by Unicode code points" do
+    prefix = "safe_etf_#{System.unique_integer([:positive, :monotonic])}_"
+    valid_name = prefix <> String.duplicate("\u0301", 255 - length(String.codepoints(prefix)))
+    invalid_name = valid_name <> "\u0301"
+    valid_atom = utf8_atom(valid_name)
+    invalid_atom = utf8_atom(invalid_name)
+
+    assert {:ok, %{"module" => %UnresolvedAtom{name: ^valid_name}}} =
+             SafeETF.decode_map(map_with("module", valid_atom), %{"module" => :nullable_atom})
+
+    valid_pid =
+      <<103, valid_atom::binary, 0xFFFFFFFF::unsigned-big-32, 0::unsigned-big-32, 0>>
+
+    assert {:ok, %{"identity" => %UnresolvedIdentity{node: ^valid_name}}} =
+             SafeETF.decode_map(map_with("identity", valid_pid), %{"identity" => :pid})
+
+    assert is_pid(:erlang.binary_to_term(<<131, valid_pid::binary>>))
+
+    assert {:error, "malformed external term"} =
+             SafeETF.decode_map(map_with("module", invalid_atom), %{
+               "module" => :nullable_atom
+             })
+
+    invalid_pid = <<103, invalid_atom::binary, 0::unsigned-big-32, 0::unsigned-big-32, 0>>
+
+    assert {:error, "malformed external term"} =
+             SafeETF.decode_map(map_with("identity", invalid_pid), %{"identity" => :pid})
   end
 
   test "keeps current-node identities native" do
@@ -185,5 +223,9 @@ defmodule DurableServer.SafeETFTest do
 
   defp small_atom(name) when byte_size(name) <= 255 do
     <<119, byte_size(name), name::binary>>
+  end
+
+  defp utf8_atom(name) when byte_size(name) <= 1_020 do
+    <<118, byte_size(name)::unsigned-big-16, name::binary>>
   end
 end

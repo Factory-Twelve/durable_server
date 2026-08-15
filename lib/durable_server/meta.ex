@@ -2,7 +2,7 @@ defmodule DurableServer.Meta do
   # represents the object metadata in storage
   alias DurableServer.Meta
   alias DurableServer.Meta.{ExternalAtom, ExternalIdentity}
-  alias DurableServer.Meta.Storage.V1
+  alias DurableServer.Meta.Storage.{ObjectStoreLegacy, V1}
 
   defstruct vsn: 1,
             module: nil,
@@ -97,6 +97,17 @@ defmodule DurableServer.Meta do
 
   def encode_to_binary(%Meta{} = meta) do
     {_storage_term, binary} = validated_storage_term(meta)
+
+    encoded = Base.encode64(binary)
+    validate_produced_size!(encoded, @max_metadata_base64_bytes, "encoded metadata")
+    encoded
+  end
+
+  def encode_to_object_store_binary(%Meta{} = meta) do
+    validate_storage_term!(Map.from_struct(meta))
+
+    binary = ObjectStoreLegacy.dump_binary(meta)
+    validate_produced_size!(binary, @max_metadata_binary_bytes, "metadata external term")
 
     encoded = Base.encode64(binary)
     validate_produced_size!(encoded, @max_metadata_base64_bytes, "encoded metadata")

@@ -79,6 +79,8 @@ defmodule DurableServer.Meta.Storage.V1 do
 
   def fields, do: @fields
 
+  def field_type(field), do: Map.fetch!(@field_type_by_name, field)
+
   defp storage_key_name!(key) when is_atom(key), do: Atom.to_string(key)
   defp storage_key_name!(key) when is_binary(key), do: key
 

@@ -23,7 +23,6 @@ defmodule DurableServer.SafeETF do
   @max_atom_bytes 255
   @max_utf8_atom_bytes 1_020
   @max_term_bytes 65_536
-  @max_legacy_pid_id 0x0FFFFFFF
   @max_legacy_reference_first_id 0x0003FFFF
   @max_legacy_creation 3
 
@@ -49,6 +48,13 @@ defmodule DurableServer.SafeETF do
 
   @pid_tags [@pid_ext, @new_pid_ext]
   @reference_tags [@reference_ext, @new_reference_ext, @newer_reference_ext]
+
+  def valid_atom_name?(name) when is_binary(name) do
+    String.valid?(name) and byte_size(name) <= @max_utf8_atom_bytes and
+      length(String.codepoints(name)) <= 255
+  end
+
+  def valid_atom_name?(_name), do: false
 
   @doc """
   Decodes a bounded ETF map without creating atoms.
@@ -234,7 +240,7 @@ defmodule DurableServer.SafeETF do
        do: skip_new_reference(rest, id_words)
 
   defp skip_term(<<@newer_reference_ext, id_words::unsigned-big-16, rest::binary>>, _depth)
-       when id_words > 0 and id_words <= @max_reference_id_words,
+       when id_words <= @max_reference_id_words,
        do: skip_newer_reference(rest, id_words)
 
   defp skip_term(binary, _depth), do: skip_atom(binary)
@@ -249,8 +255,7 @@ defmodule DurableServer.SafeETF do
 
   defp skip_legacy_pid(binary) do
     with {:ok, rest} <- skip_atom(binary),
-         <<id::unsigned-big-32, _serial::unsigned-big-32, creation, tail::binary>> <- rest,
-         true <- id <= @max_legacy_pid_id,
+         <<_id::unsigned-big-32, _serial::unsigned-big-32, creation, tail::binary>> <- rest,
          true <- creation <= @max_legacy_creation do
       {:ok, tail}
     end
@@ -285,8 +290,7 @@ defmodule DurableServer.SafeETF do
 
   defp skip_newer_reference(binary, id_words) do
     with {:ok, rest} <- skip_atom(binary),
-         <<_creation::unsigned-big-32, _first_id::unsigned-big-32,
-           _remaining_ids::binary-size((id_words - 1) * 4), tail::binary>> <- rest do
+         <<_creation::unsigned-big-32, _ids::binary-size(id_words * 4), tail::binary>> <- rest do
       {:ok, tail}
     end
   end
@@ -320,11 +324,12 @@ defmodule DurableServer.SafeETF do
   defp take_atom_payload(_rest, _size, _encoding), do: :error
 
   defp normalize_atom_name(name, :utf8) do
-    if String.valid?(name) and String.length(name) <= 255, do: {:ok, name}, else: :error
+    if valid_atom_name?(name), do: {:ok, name}, else: :error
   end
 
   defp normalize_atom_name(name, :latin1) do
-    {:ok, :unicode.characters_to_binary(name, :latin1, :utf8)}
+    normalized = :unicode.characters_to_binary(name, :latin1, :utf8)
+    if valid_atom_name?(normalized), do: {:ok, normalized}, else: :error
   rescue
     _error -> :error
   end

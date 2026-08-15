@@ -27,7 +27,7 @@ defmodule DurableServer.StoredState do
     %{
       "vsn" => vsn,
       "state" => state,
-      "meta" => Meta.encode_to_binary(meta)
+      "meta" => Meta.encode_to_object_store_binary(meta)
     }
   end
 

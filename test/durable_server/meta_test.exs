@@ -3,7 +3,7 @@ defmodule DurableServer.MetaTest do
 
   alias DurableServer.Meta
   alias DurableServer.Meta.{ExternalAtom, ExternalIdentity}
-  alias DurableServer.Meta.Storage.V1
+  alias DurableServer.Meta.Storage.{ObjectStoreLegacy, V1}
   alias DurableServer.StoredState
 
   @context %{key: "server-key", prefix: "tenant/"}
@@ -80,6 +80,13 @@ defmodule DurableServer.MetaTest do
       })
     end
 
+    assert_raise ArgumentError, ~r/metadata external term exceeds 65536 byte limit/, fn ->
+      Meta.encode_to_object_store_binary(%Meta{
+        status: :stopped_graceful,
+        node_str: :binary.copy("x", @max_binary_bytes)
+      })
+    end
+
     invalid_external_identity = %ExternalIdentity{
       kind: :pid,
       node: "wrong@node",
@@ -94,6 +101,24 @@ defmodule DurableServer.MetaTest do
       Meta.encode_to_binary(%Meta{
         status: :running,
         module: %ExternalAtom{name: :binary.copy("a", 256)}
+      })
+    end
+  end
+
+  test "legacy object-store encoding rejects wrappers outside their declared fields" do
+    nested = %ExternalAtom{name: "unsupported_nested_atom"}
+
+    assert_raise ArgumentError, ~r/unsupported nested external wrapper/, fn ->
+      ObjectStoreLegacy.dump_binary(%Meta{
+        status: :stopped_graceful,
+        crash_history: [%{timestamp: 1, reason: nested}]
+      })
+    end
+
+    assert_raise ArgumentError, ~r/invalid metadata field :crash_history/, fn ->
+      Meta.encode_to_object_store_binary(%Meta{
+        status: :stopped_graceful,
+        crash_history: [%{timestamp: 1, reason: nested}]
       })
     end
   end
@@ -328,7 +353,8 @@ defmodule DurableServer.MetaTest do
   end
 
   test "preserves the maximum UTF-8 atom name and rejects longer names" do
-    max_name = String.duplicate("é", 255)
+    prefix = "meta_#{System.unique_integer([:positive, :monotonic])}_"
+    max_name = prefix <> String.duplicate("\u0301", 255 - length(String.codepoints(prefix)))
     max_atom = <<118, byte_size(max_name)::unsigned-big-16, max_name::binary>>
     encoded = metadata_with_raw_value("module", max_atom) |> Base.encode64()
 
@@ -339,7 +365,7 @@ defmodule DurableServer.MetaTest do
 
     assert_raise ArgumentError, fn -> String.to_existing_atom(max_name) end
 
-    oversized_name = String.duplicate("é", 256)
+    oversized_name = max_name <> "\u0301"
     oversized_atom = <<118, byte_size(oversized_name)::unsigned-big-16, oversized_name::binary>>
     oversized_encoded = metadata_with_raw_value("module", oversized_atom) |> Base.encode64()
 

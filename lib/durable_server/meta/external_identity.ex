@@ -53,6 +53,8 @@ end
 defmodule DurableServer.Meta.ExternalAtom do
   @moduledoc false
 
+  alias DurableServer.SafeETF
+
   @enforce_keys [:name]
   defstruct [:name]
 
@@ -67,7 +69,7 @@ defmodule DurableServer.Meta.ExternalAtom do
   end
 
   def valid?(%__MODULE__{name: name}) when is_binary(name) do
-    String.valid?(name) and byte_size(name) <= 1_020 and String.length(name) <= 255
+    SafeETF.valid_atom_name?(name)
   end
 
   def valid?(%__MODULE__{}), do: false
